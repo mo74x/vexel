@@ -5,16 +5,28 @@ import { PrismaClient, RunStatus } from '@prisma/client';
 import { createHash } from 'crypto';
 import { VexelLockService } from '../redis/vexel-lock.service';
 import { AnvilStepContext } from '@vexel/anvil-engine';
+import {
+  BilingualTranscriberService,
+  MergedTranscriptBundle,
+  ResolvedCrmContext,
+  UsageMeterService,
+  ZodExtractorService,
+} from '@vexel/extractor';
 
 @Processor('vexel-workflows', { concurrency: 10 })
 export class RevOpsWorkflowProcessor extends WorkerHost {
   private readonly logger = new Logger(RevOpsWorkflowProcessor.name);
+  private readonly bilingualTranscriber: BilingualTranscriberService;
+  private readonly zodExtractor: ZodExtractorService;
 
   constructor(
     private readonly prisma: PrismaClient,
     private readonly lockService: VexelLockService,
   ) {
     super();
+    const usageMeter = new UsageMeterService(this.prisma);
+    this.bilingualTranscriber = new BilingualTranscriberService(usageMeter);
+    this.zodExtractor = new ZodExtractorService(usageMeter);
   }
 
   async process(job: Job, token?: string): Promise<any> {
@@ -157,13 +169,35 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
   }
 
   private async transcribeAndMergeBatch(tenantId: string, runId: string, messages: any[]) {
-    return { senderPhone: messages[0]?.senderPhone, mergedTranscript: '' };
+    const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
+    return this.bilingualTranscriber.transcribeAndMergeBatch(
+      tenantId,
+      runId,
+      process.env.WHATSAPP_SYSTEM_TOKEN!,
+      messages,
+    );
   }
-  private async resolveHubSpotEntities(tenantId: string, senderPhone: string) {
-    return { contactId: null, activeDealId: null, currentDealStage: null };
+  private async resolveHubSpotEntities(
+    tenantId: string,
+    senderPhone: string,
+  ): Promise<ResolvedCrmContext> {
+    return {
+      contactId: null,
+      contactName: null,
+      companyName: null,
+      activeDealId: null,
+      currentDealName: null,
+      currentDealStage: null,
+      currentAmount: null,
+    };
   }
-  private async extractCrmTransitionWithZod(tenantId: string, runId: string, bundle: any, crm: any) {
-    return { confidenceScore: 92, dealStage: 'contractsent', amount: 12000, summaryNote: '' };
+  private async extractCrmTransitionWithZod(
+    tenantId: string,
+    runId: string,
+    bundle: MergedTranscriptBundle,
+    crmContext: ResolvedCrmContext,
+  ) {
+    return this.zodExtractor.extractTransition(tenantId, runId, bundle, crmContext);
   }
   private async sendInteractiveApprovalPrompt(tenantId: string, runId: string, payload: any) {
     return { messageDispatched: true };

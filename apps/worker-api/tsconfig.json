@@ -7,7 +7,8 @@
     "paths": {
       "@prisma/client": ["../../packages/database/node_modules/@prisma/client"],
       "@vexel/database": ["../../packages/database/src/index.ts"],
-      "@vexel/anvil-engine": ["../../packages/anvil-engine/src/runner.ts"]
+      "@vexel/anvil-engine": ["../../packages/anvil-engine/src/runner.ts"],
+      "@vexel/extractor": ["../../packages/extractor/src/index.ts"]
     }
   },
   "include": ["src/**/*"],
