@@ -1,5 +1,5 @@
 import { Processor, WorkerHost } from '@nestjs/bullmq';
-import { Job, DelayedError } from 'bullmq';
+import { Job, DelayedError, UnrecoverableError } from 'bullmq';
 import { Logger } from '@nestjs/common';
 import { PrismaClient, RunStatus } from '@prisma/client';
 import { createHash } from 'crypto';
@@ -8,6 +8,7 @@ import { AnvilStepContext } from '@vexel/anvil-engine';
 import {
   BilingualTranscriberService,
   MergedTranscriptBundle,
+  PipelineStageCacheService,
   ResolvedCrmContext,
   UsageMeterService,
   ZodExtractorService,
@@ -18,6 +19,7 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
   private readonly logger = new Logger(RevOpsWorkflowProcessor.name);
   private readonly bilingualTranscriber: BilingualTranscriberService;
   private readonly zodExtractor: ZodExtractorService;
+  private readonly stageCache: PipelineStageCacheService;
 
   constructor(
     private readonly prisma: PrismaClient,
@@ -26,7 +28,8 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
     super();
     const usageMeter = new UsageMeterService(this.prisma);
     this.bilingualTranscriber = new BilingualTranscriberService(usageMeter);
-    this.zodExtractor = new ZodExtractorService(usageMeter);
+    this.stageCache = new PipelineStageCacheService(this.lockService.redis);
+    this.zodExtractor = new ZodExtractorService(usageMeter, this.stageCache);
   }
 
   async process(job: Job, token?: string): Promise<any> {
@@ -107,10 +110,28 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
         return { status: 'paused_waiting_for_approval', runId: run.id };
       }
 
-      // STEP 5: Idempotent HubSpot v4 Batch Sync
-      const syncResult = await anvil.run('step-5-sync-hubspot-v4', async () => {
-        return this.syncToHubSpotV4(tenantId, run.id, crmContext, finalPayload);
-      });
+      // STEP 5: Idempotent HubSpot v4 Batch Sync with Stale-Stage Recovery
+      let syncResult: { dealId: string };
+      try {
+        syncResult = await anvil.run('step-5-sync-hubspot-v4', async () => {
+          return this.syncToHubSpotV4(tenantId, run.id, crmContext, finalPayload);
+        });
+      } catch (err: any) {
+        if (err?.isPermanentOAuthError === true || err?.name === 'HubSpotOAuthRevokedError') {
+          await this.prisma.workflowRun.updateMany({
+            where: { id: existingRunId },
+            data: {
+              status: RunStatus.DEAD_LETTER,
+              errorMessage: err.message,
+            },
+          });
+          // Skip remaining BullMQ attempts immediately
+          throw new UnrecoverableError(err.message);
+        }
+
+        // 3. Re-throw to BullMQ to trigger backoff retry starting cleanly at Step 3
+        throw err;
+      }
 
       await this.prisma.workflowRun.update({
         where: { id: run.id },
@@ -197,7 +218,10 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
     bundle: MergedTranscriptBundle,
     crmContext: ResolvedCrmContext,
   ) {
-    return this.zodExtractor.extractTransition(tenantId, runId, bundle, crmContext);
+    // TODO: the tenant's HubSpot OAuth access token once the token store is wired up.
+    // With `null`, PipelineStageCacheService falls back to HubSpot's default pipeline stages.
+    const hubspotAccessToken: string | null = null;
+    return this.zodExtractor.extractTransition(tenantId, runId, hubspotAccessToken, bundle, crmContext);
   }
   private async sendInteractiveApprovalPrompt(tenantId: string, runId: string, payload: any) {
     return { messageDispatched: true };

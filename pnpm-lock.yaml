@@ -243,6 +243,9 @@ importers:
       '@vexel/database':
         specifier: workspace:*
         version: link:../../packages/database
+      '@vexel/extractor':
+        specifier: workspace:*
+        version: link:../../packages/extractor
       bullmq:
         specifier: ^6.5.3
         version: 6.5.3(ioredis@6.0.0)(pg@8.23.1)
@@ -268,7 +271,24 @@ importers:
         specifier: workspace:*
         version: link:../database
 
-  packages/crm-hubspot: {}
+  packages/crm-hubspot:
+    dependencies:
+      '@prisma/client':
+        specifier: ^7.10.1
+        version: 7.10.1(prisma@7.10.1(@types/node@26.6.6)(@types/react@19.3.0)(magicast@0.5.5)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(typescript@7.0.2))(typescript@7.0.2)
+      '@vexel/extractor':
+        specifier: workspace:*
+        version: link:../extractor
+      ioredis:
+        specifier: ^6.0.0
+        version: 6.0.0
+    devDependencies:
+      '@types/node':
+        specifier: ^26.6.6
+        version: 26.6.6
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
 
   packages/database:
     dependencies:
@@ -300,6 +320,9 @@ importers:
       '@prisma/client':
         specifier: ^7.10.1
         version: 7.10.1(prisma@7.10.1(@types/node@26.6.6)(@types/react@19.3.0)(magicast@0.5.5)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(typescript@7.0.2))(typescript@7.0.2)
+      ioredis:
+        specifier: ^6.0.0
+        version: 6.0.0
       openai:
         specifier: ^7.47.0
         version: 7.47.0(zod@4.6.7)

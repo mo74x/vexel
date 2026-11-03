@@ -1,8 +1,9 @@
-/**
- * Deterministically repairs common LLM JSON/type drift before Zod parsing
- * so trivial formatting quirks never burn an extra LLM repair turn.
- */
-export function sanitizeRawToolInput(raw: unknown): Record<string, any> {
+import { TenantDealStage } from '../cache/pipeline-stage-cache.service';
+
+export function sanitizeRawToolInput(
+  raw: unknown,
+  tenantStages: TenantDealStage[] = [],
+): Record<string, any> {
   if (!raw || typeof raw !== 'object') {
     return {};
   }
@@ -27,23 +28,40 @@ export function sanitizeRawToolInput(raw: unknown): Record<string, any> {
   };
   cleanNullStrings(clone);
 
-  // 2. Coerce stringified numbers with commas/currency symbols (e.g., "$15,000" -> 15000)
+  // 2. Coerce stringified numbers with commas/currency symbols
   if (typeof clone.amount === 'string') {
     const numeric = Number(clone.amount.replace(/[^0-9.-]+/g, ''));
     clone.amount = Number.isFinite(numeric) ? numeric : null;
   }
 
-  // 3. Slice full ISO datetime strings (2026-11-15T00:00:00.000Z) to YYYY-MM-DD
+  // 3. Slice full ISO datetime strings to YYYY-MM-DD
   if (typeof clone.expectedCloseDateIso === 'string' && clone.expectedCloseDateIso.includes('T')) {
     clone.expectedCloseDateIso = clone.expectedCloseDateIso.split('T')[0];
   }
 
-  // 4. Normalize dealStage casing & strip spaces (e.g., "Contract Sent" -> "contractsent")
+  // 4. Dynamic Stage Label -> Internal HubSpot ID Resolution
   if (typeof clone.dealStage === 'string') {
-    clone.dealStage = clone.dealStage.toLowerCase().replace(/[\s_-]+/g, '');
+    const rawStage = clone.dealStage.trim();
+    const norm = (s: string) => s.toLowerCase().replace(/[\s_-]+/g, '');
+
+    if (norm(rawStage) === 'unchanged') {
+      clone.dealStage = 'unchanged';
+    } else {
+      // Match against exact ID, normalized ID, or normalized human-readable label
+      const matchedStage = tenantStages.find(
+        (s) =>
+          s.id === rawStage ||
+          norm(s.id) === norm(rawStage) ||
+          norm(s.label) === norm(rawStage),
+      );
+
+      if (matchedStage) {
+        clone.dealStage = matchedStage.id; // Always output exact internal HubSpot ID
+      }
+    }
   }
 
-  // 5. Coerce confidenceScore if returned as string or float
+  // 5. Clamp confidenceScore to 0-100 integer
   if (clone.confidenceScore !== undefined && clone.confidenceScore !== null) {
     const parsedScore = Math.round(Number(clone.confidenceScore));
     if (Number.isFinite(parsedScore)) {
