@@ -1,0 +1,16 @@
+{
+  "name": "@vexel/anvil-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/runner.ts",
+  "types": "./src/runner.ts",
+  "exports": {
+    ".": "./src/runner.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^7.10.1",
+    "@vexel/database": "workspace:*"
+  }
+}
+

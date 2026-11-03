@@ -1,0 +1,26 @@
+version: '3.9'
+services:
+  vexel-postgres:
+    image: postgres:16-alpine
+    container_name: vexel-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: vexel
+      POSTGRES_PASSWORD: vexel_dev_password
+      POSTGRES_DB: vexel_core
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  vexel-redis:
+    image: redis:7-alpine
+    container_name: vexel-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+
+volumes:
+  pgdata:
+  redisdata:

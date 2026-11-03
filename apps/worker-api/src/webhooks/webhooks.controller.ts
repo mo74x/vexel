@@ -1,0 +1,138 @@
+import {
+  Controller,
+  Post,
+  Param,
+  Body,
+  Headers,
+  HttpCode,
+  BadRequestException,
+} from '@nestjs/common';
+import { InjectQueue } from '@nestjs/bullmq';
+import { Queue } from 'bullmq';
+import { createHash } from 'crypto';
+import { VexelLockService, InboundEventPayload } from '../redis/vexel-lock.service';
+
+@Controller('v1/webhooks')
+export class WebhooksController {
+  private readonly DEBOUNCE_WINDOW_MS = 30_000; // 30-second sliding window
+
+  constructor(
+    private readonly lockService: VexelLockService,
+    @InjectQueue('vexel-workflows') private readonly workflowQueue: Queue,
+  ) {}
+
+  @Post(':tenantId/ingest')
+  @HttpCode(202)
+  async ingestOmnichannelEvent(
+    @Param('tenantId') tenantId: string,
+    @Headers('x-hub-signature-256') signature: string,
+    @Body() body: any,
+  ) {
+    // 1. Normalize incoming WhatsApp / Voice payload
+    const payload = this.normalizePayload(body);
+    if (!payload) {
+      return { status: 'ignored_non_message_event' };
+    }
+
+    // 2. Fast SHA-256 edge deduplication
+    const eventHash = createHash('sha256')
+      .update(`${tenantId}:${payload.messageId}`)
+      .digest('hex');
+
+    const isFirstSeen = await this.lockService.claimIdempotencyKey(tenantId, eventHash);
+    if (!isFirstSeen) {
+      return { status: 'duplicate_dropped', messageId: payload.messageId };
+    }
+
+    // 3. Push message into Redis sliding-window list
+    const bufferedCount = await this.lockService.appendToBuffer(
+      tenantId,
+      payload.senderPhone,
+      payload,
+    );
+
+    // 4. Upsert or reset the 30s delayed BullMQ job for this sender
+    const debounceJobId = `debounce:${tenantId}:${payload.senderPhone}`;
+    const existingJob = await this.workflowQueue.getJob(debounceJobId);
+
+    if (existingJob) {
+      const state = await existingJob.getState();
+      if (state === 'delayed') {
+        // Push the timer forward by another 30 seconds from now
+        await existingJob.changeDelay(this.DEBOUNCE_WINDOW_MS);
+        return {
+          status: 'debounced_window_extended',
+          bufferedCount,
+          jobId: debounceJobId,
+        };
+      }
+    }
+
+    await this.workflowQueue.add(
+      'execute-revops-pipeline',
+      {
+        tenantId,
+        senderPhone: payload.senderPhone,
+        mode: 'INITIAL_INGEST',
+      },
+      {
+        jobId: debounceJobId,
+        delay: this.DEBOUNCE_WINDOW_MS,
+        attempts: 5,
+        backoff: { type: 'exponential', delay: 5000 },
+        removeOnComplete: true,
+      },
+    );
+
+    return {
+      status: 'buffered_and_scheduled',
+      bufferedCount,
+      executeInMs: this.DEBOUNCE_WINDOW_MS,
+    };
+  }
+
+  /**
+   * Triggered when a sales rep clicks [Approve & Sync] on WhatsApp or Slack
+   */
+  @Post('approval-callback')
+  @HttpCode(200)
+  async handleRepApproval(
+    @Body() body: { runId: string; tenantId: string; approved: boolean; editedPatch?: Record<string, any> },
+  ) {
+    if (!body.runId || !body.tenantId) {
+      throw new BadRequestException('Missing runId or tenantId');
+    }
+
+    await this.workflowQueue.add(
+      'execute-revops-pipeline',
+      {
+        tenantId: body.tenantId,
+        runId: body.runId,
+        mode: 'RESUME_AFTER_APPROVAL',
+        approved: body.approved,
+        editedPatch: body.editedPatch,
+      },
+      {
+        jobId: `resume:${body.runId}`,
+        attempts: 5,
+        backoff: { type: 'exponential', delay: 4000 },
+      },
+    );
+
+    return { status: 'workflow_resumed', runId: body.runId };
+  }
+
+  private normalizePayload(body: any): InboundEventPayload | null {
+    const entry = body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    if (!entry) return null;
+
+    return {
+      messageId: entry.id,
+      senderPhone: entry.from,
+      type: entry.type === 'audio' ? 'audio' : 'text',
+      text: entry.text?.body,
+      mediaUrl: entry.audio?.id,
+      timestamp: Number(entry.timestamp) * 1000,
+    };
+  }
+}

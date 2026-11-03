@@ -1,0 +1,91 @@
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum RunStatus {
+  PENDING
+  RUNNING
+  WAITING_APPROVAL
+  COMPLETED
+  FAILED
+  DEAD_LETTER
+}
+
+enum StepStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+model Tenant {
+  id                  String         @id @default(cuid())
+  name                String
+  slug                String         @unique
+  hubspotPortalId     String?        @unique
+  hubspotAccessToken  String?
+  hubspotRefreshToken String?
+  hubspotTokenExpires DateTime?
+  whatsappPhoneId     String?        @unique
+  autoSyncThreshold   Int            @default(85) // Confidence % threshold
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+  workflowRuns        WorkflowRun[]
+  usageLedgers        UsageLedger[]
+}
+
+model WorkflowRun {
+  id              String         @id @default(cuid())
+  tenantId        String
+  tenant          Tenant         @relation(fields: [tenantId], references: [id])
+  idempotencyKey  String         @unique // SHA-256 of webhook event
+  workflowName    String         // e.g., "omnichannel-to-hubspot-v1"
+  externalDealId  String?        // HubSpot Deal ID once resolved
+  status          RunStatus      @default(PENDING)
+  inputPayload    Json           // Raw WhatsApp/Voice webhook metadata
+  extractedData   Json?          // Validated Zod CRM transition object
+  confidenceScore Int?
+  currentStepIdx  Int            @default(0)
+  errorMessage    String?
+  startedAt       DateTime       @default(now())
+  completedAt     DateTime?
+  steps           WorkflowStep[]
+  usageEntries    UsageLedger[]
+
+  @@index([tenantId, status])
+  @@index([externalDealId])
+}
+
+model WorkflowStep {
+  id          String      @id @default(cuid())
+  runId       String
+  run         WorkflowRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  stepKey     String      // e.g., "transcribe-audio", "extract-zod", "sync-hubspot"
+  attempt     Int         @default(1)
+  status      StepStatus  @default(PENDING)
+  outputData  Json?       // Cached step result for deterministic replay
+  errorLog    String?
+  durationMs  Int?
+  executedAt  DateTime    @default(now())
+
+  @@unique([runId, stepKey]) // Guarantees deterministic replay cache lookup
+}
+
+model UsageLedger {
+  id               String      @id @default(cuid())
+  tenantId         String
+  tenant           Tenant      @relation(fields: [tenantId], references: [id])
+  runId            String
+  run              WorkflowRun @relation(fields: [runId], references: [id])
+  provider         String      // "anthropic-claude-3-7", "deepgram-nova"
+  promptTokens     Int         @default(0)
+  completionTokens Int         @default(0)
+  audioSeconds     Int         @default(0)
+  estimatedCostUsd Decimal     @db.Decimal(10, 6)
+  recordedAt       DateTime    @default(now())
+
+  @@index([tenantId, recordedAt])
+}
