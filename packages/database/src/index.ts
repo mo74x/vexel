@@ -21,4 +21,9 @@ if (process.env.NODE_ENV !== "production") {
 
 export * from "@prisma/client";
 export * from "./extensions/encrypted-token-guard.extension";
+export {
+  assertEncryptedTokenPayloads,
+  vexelEncryptedTokenGuard,
+} from "./guards/token-envelope.guard";
+export type { VexelPrismaClient } from "./client";
 export * from "./prisma.service";

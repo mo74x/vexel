@@ -2,11 +2,19 @@ import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job, DelayedError, UnrecoverableError } from 'bullmq';
 import { Logger } from '@nestjs/common';
 import { PrismaClient, RunStatus } from '@prisma/client';
+import { PrismaService } from '@vexel/database';
 import { createHash } from 'crypto';
 import { VexelLockService } from '../redis/vexel-lock.service';
 import { AnvilStepContext } from '@vexel/anvil-engine';
 import {
+  EnvelopeCryptoService,
+  HubSpotDealSyncService,
+  HubSpotHttpClient,
+  HubSpotTokenManagerService,
+} from '@vexel/crm-hubspot';
+import {
   BilingualTranscriberService,
+  CrmTransitionPayload,
   MergedTranscriptBundle,
   PipelineStageCacheService,
   ResolvedCrmContext,
@@ -20,16 +28,28 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
   private readonly bilingualTranscriber: BilingualTranscriberService;
   private readonly zodExtractor: ZodExtractorService;
   private readonly stageCache: PipelineStageCacheService;
+  private readonly tokenManager: HubSpotTokenManagerService;
+  private readonly dealSync: HubSpotDealSyncService;
 
   constructor(
-    private readonly prisma: PrismaClient,
+    private readonly prisma: PrismaService,
     private readonly lockService: VexelLockService,
   ) {
     super();
-    const usageMeter = new UsageMeterService(this.prisma);
+    const rawPrisma = this.prisma.client as unknown as PrismaClient;
+    const usageMeter = new UsageMeterService(rawPrisma);
     this.bilingualTranscriber = new BilingualTranscriberService(usageMeter);
     this.stageCache = new PipelineStageCacheService(this.lockService.redis);
     this.zodExtractor = new ZodExtractorService(usageMeter, this.stageCache);
+
+    const envelopeCrypto = new EnvelopeCryptoService();
+    this.tokenManager = new HubSpotTokenManagerService(
+      rawPrisma,
+      this.lockService.redis,
+      envelopeCrypto,
+    );
+    const httpClient = new HubSpotHttpClient(this.lockService.redis, this.tokenManager);
+    this.dealSync = new HubSpotDealSyncService(httpClient);
   }
 
   async process(job: Job, token?: string): Promise<any> {
@@ -56,7 +76,11 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
         return { status: 'empty_buffer_skipped' };
       }
 
-      const anvil = new AnvilStepContext(this.prisma, run.id, tenantId);
+      const anvil = new AnvilStepContext(
+        this.prisma.client as unknown as PrismaClient,
+        run.id,
+        tenantId,
+      );
 
       // Handle Rep Rejection if resuming from approval
       if (mode === 'RESUME_AFTER_APPROVAL' && approved === false) {
@@ -67,84 +91,118 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
         return { status: 'rejected_by_rep', runId: run.id };
       }
 
-      // STEP 1: Transcribe Audio & Merge Conversation Window
-      const transcriptBundle = await anvil.run('step-1-transcribe-window', async () => {
-        const messages = (run.inputPayload as any).messages as any[];
-        // Calls Deepgram/Whisper for audio items & logs audioSeconds to UsageLedger
-        return this.transcribeAndMergeBatch(tenantId, run.id, messages);
-      });
-
-      // STEP 2: Deterministic HubSpot Contact & Active Deal Resolution
-      const crmContext = await anvil.run('step-2-resolve-hubspot-entities', async () => {
-        return this.resolveHubSpotEntities(tenantId, transcriptBundle.senderPhone);
-      });
-
-      // STEP 3: Schema-Validated LLM Extraction + Token Metering
-      const extraction = await anvil.run('step-3-extract-zod-schema', async () => {
-        return this.extractCrmTransitionWithZod(tenantId, run.id, transcriptBundle, crmContext);
-      });
-
-      // Apply manual rep edits if resuming from WhatsApp approval card
-      const finalPayload = editedPatch ? { ...extraction, ...editedPatch } : extraction;
-
-      // STEP 4: Confidence Gate & Human-in-the-Loop Pause
-      const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
-      const needsApproval =
-        mode !== 'RESUME_AFTER_APPROVAL' &&
-        extraction.confidenceScore <= tenant.autoSyncThreshold;
-
-      if (needsApproval) {
-        await anvil.run('step-4-dispatch-approval-prompt', async () => {
-          await this.prisma.workflowRun.update({
-            where: { id: run.id },
-            data: {
-              status: RunStatus.WAITING_APPROVAL,
-              extractedData: finalPayload,
-              confidenceScore: extraction.confidenceScore,
-            },
-          });
-          return this.sendInteractiveApprovalPrompt(tenantId, run.id, finalPayload);
-        });
-
-        this.logger.log(`Run ${run.id} paused in WAITING_APPROVAL (Confidence: ${extraction.confidenceScore}%)`);
-        return { status: 'paused_waiting_for_approval', runId: run.id };
-      }
-
-      // STEP 5: Idempotent HubSpot v4 Batch Sync with Stale-Stage Recovery
-      let syncResult: { dealId: string };
       try {
-        syncResult = await anvil.run('step-5-sync-hubspot-v4', async () => {
-          return this.syncToHubSpotV4(tenantId, run.id, crmContext, finalPayload);
+        // STEP 1: Transcribe Audio & Merge Conversation Window
+        const transcriptBundle = await anvil.run('step-1-transcribe-window', async () => {
+          const messages = (run.inputPayload as any).messages as any[];
+          // Calls Deepgram/Whisper for audio items & logs audioSeconds to UsageLedger
+          return this.transcribeAndMergeBatch(tenantId, run.id, messages);
         });
+
+        // STEP 2: Deterministic HubSpot Contact & Active Deal Resolution
+        const crmContext = await anvil.run('step-2-resolve-hubspot-entities', async () => {
+          return this.resolveHubSpotEntities(tenantId, transcriptBundle.senderPhone);
+        });
+
+        // STEP 3: Schema-Validated LLM Extraction + Token Metering
+        const extraction = await anvil.run('step-3-extract-zod-schema', async () => {
+          return this.extractCrmTransitionWithZod(tenantId, run.id, transcriptBundle, crmContext);
+        });
+
+        // Apply manual rep edits if resuming from WhatsApp approval card
+        const finalPayload = editedPatch ? { ...extraction, ...editedPatch } : extraction;
+
+        // STEP 4: Confidence Gate & Human-in-the-Loop Pause
+        const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
+        const needsApproval =
+          mode !== 'RESUME_AFTER_APPROVAL' &&
+          extraction.confidenceScore <= tenant.autoSyncThreshold;
+
+        if (needsApproval) {
+          await anvil.run('step-4-dispatch-approval-prompt', async () => {
+            await this.prisma.workflowRun.update({
+              where: { id: run.id },
+              data: {
+                status: RunStatus.WAITING_APPROVAL,
+                extractedData: finalPayload,
+                confidenceScore: extraction.confidenceScore,
+              },
+            });
+            return this.sendInteractiveApprovalPrompt(tenantId, run.id, finalPayload);
+          });
+
+          this.logger.log(`Run ${run.id} paused in WAITING_APPROVAL (Confidence: ${extraction.confidenceScore}%)`);
+          return { status: 'paused_waiting_for_approval', runId: run.id };
+        }
+
+        // STEP 5: Idempotent HubSpot v4 Batch Sync with Stale-Stage Recovery
+        let syncResult: { dealId: string };
+        try {
+          syncResult = await anvil.run('step-5-sync-hubspot-v4', async () => {
+            return this.syncToHubSpotV4(tenantId, run.id, crmContext, finalPayload);
+          });
+        } catch (err: any) {
+          if (err?.isStaleDealStage === true || err?.name === 'StaleDealStageError') {
+            const pipelineId = crmContext.pipelineId ?? 'default';
+
+            this.logger.warn(
+              `[Self-Healing] Stale HubSpot dealstage "${finalPayload.dealStage}" detected on run ${run.id}. Evicting Redis pipeline cache & Step 3 output...`,
+            );
+
+            // 1. Purge stale custom stages from Redis so next run fetches live from HubSpot
+            await this.stageCache.invalidateTenantStages(tenantId, pipelineId);
+
+            // 2. Evict Step 3, 4, and 5 from Anvil PG step cache (preserving Step 1 Audio & Step 2 CRM lookup)
+            await anvil.invalidateSteps(
+              [
+                'step-3-extract-zod-schema',
+                'step-4-dispatch-approval-prompt',
+                'step-5-sync-hubspot-v4',
+              ],
+              `Stale HubSpot stage ID "${finalPayload.dealStage}" rejected by API`,
+            );
+          }
+
+          throw err;
+        }
+
+        await this.prisma.workflowRun.update({
+          where: { id: run.id },
+          data: {
+            status: RunStatus.COMPLETED,
+            externalDealId: syncResult.dealId,
+            extractedData: finalPayload,
+            confidenceScore: extraction.confidenceScore,
+            completedAt: new Date(),
+          },
+        });
+
+        return { status: 'completed', runId: run.id, dealId: syncResult.dealId };
       } catch (err: any) {
+        // 1. Rate-Limit Backpressure: Delay BullMQ job without burning an attempt
+        if (err?.isRateLimitError === true || err?.name === 'HubSpotRateLimitError') {
+          const retryAfterMs = Number(err.retryAfterMs) || 10_000;
+          this.logger.warn(
+            `[Rate-Limit Backoff] Tenant ${tenantId} paused for ${retryAfterMs}ms (${err.message})`,
+          );
+          await job.moveToDelayed(Date.now() + retryAfterMs, token);
+          throw new DelayedError();
+        }
+
+        // 2. Permanent OAuth Revocation: Move run to DEAD_LETTER and skip remaining BullMQ attempts
         if (err?.isPermanentOAuthError === true || err?.name === 'HubSpotOAuthRevokedError') {
           await this.prisma.workflowRun.updateMany({
-            where: { id: existingRunId },
+            where: { id: run.id },
             data: {
               status: RunStatus.DEAD_LETTER,
               errorMessage: err.message,
             },
           });
-          // Skip remaining BullMQ attempts immediately
           throw new UnrecoverableError(err.message);
         }
 
-        // 3. Re-throw to BullMQ to trigger backoff retry starting cleanly at Step 3
         throw err;
       }
-
-      await this.prisma.workflowRun.update({
-        where: { id: run.id },
-        data: {
-          status: RunStatus.COMPLETED,
-          externalDealId: syncResult.dealId,
-          extractedData: finalPayload,
-          confidenceScore: extraction.confidenceScore,
-          completedAt: new Date(),
-        },
-      });
-
-      return { status: 'completed', runId: run.id, dealId: syncResult.dealId };
     } finally {
       clearInterval(heartbeat);
       await this.lockService.releaseDealLock(tenantId, lockEntityKey, lockToken);
@@ -190,7 +248,7 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
   }
 
   private async transcribeAndMergeBatch(tenantId: string, runId: string, messages: any[]) {
-    const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
+    await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
     return this.bilingualTranscriber.transcribeAndMergeBatch(
       tenantId,
       runId,
@@ -198,6 +256,7 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
       messages,
     );
   }
+
   private async resolveHubSpotEntities(
     tenantId: string,
     senderPhone: string,
@@ -212,21 +271,40 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
       currentAmount: null,
     };
   }
+
   private async extractCrmTransitionWithZod(
     tenantId: string,
     runId: string,
     bundle: MergedTranscriptBundle,
     crmContext: ResolvedCrmContext,
   ) {
-    // TODO: the tenant's HubSpot OAuth access token once the token store is wired up.
-    // With `null`, PipelineStageCacheService falls back to HubSpot's default pipeline stages.
-    const hubspotAccessToken: string | null = null;
+    let hubspotAccessToken: string | null = null;
+    try {
+      hubspotAccessToken = await this.tokenManager.getValidAccessToken(tenantId);
+    } catch (err: any) {
+      // Rethrow permanent OAuth revocations immediately; fall back to default stages if tenant simply hasn't connected OAuth yet
+      if (err?.isPermanentOAuthError === true || err?.name === 'HubSpotOAuthRevokedError') {
+        throw err;
+      }
+    }
     return this.zodExtractor.extractTransition(tenantId, runId, hubspotAccessToken, bundle, crmContext);
   }
+
   private async sendInteractiveApprovalPrompt(tenantId: string, runId: string, payload: any) {
     return { messageDispatched: true };
   }
-  private async syncToHubSpotV4(tenantId: string, runId: string, crm: any, payload: any) {
-    return { dealId: 'hs_deal_123' };
+
+  private async syncToHubSpotV4(
+    tenantId: string,
+    runId: string,
+    crm: ResolvedCrmContext,
+    payload: CrmTransitionPayload,
+  ) {
+    return this.dealSync.upsertDealProperties({
+      tenantId,
+      dealId: crm.activeDealId,
+      pipelineId: crm.pipelineId ?? 'default',
+      payload,
+    });
   }
 }

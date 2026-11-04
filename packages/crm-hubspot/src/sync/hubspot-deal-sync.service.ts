@@ -2,17 +2,19 @@ import {
   StaleDealStageError,
   isHubSpotStaleStageError,
 } from '../errors/stale-stage.error';
+import { HubSpotHttpClient } from '../client/hubspot-http.client';
 import { CrmTransitionPayload } from '@vexel/extractor';
 
 export class HubSpotDealSyncService {
+  constructor(private readonly httpClient: HubSpotHttpClient) {}
+
   async upsertDealProperties(params: {
     tenantId: string;
-    accessToken: string;
     dealId: string | null;
     pipelineId: string;
     payload: CrmTransitionPayload;
   }): Promise<{ dealId: string }> {
-    const { tenantId, accessToken, dealId, pipelineId, payload } = params;
+    const { tenantId, dealId, pipelineId, payload } = params;
 
     const properties: Record<string, string | number> = {};
 
@@ -31,43 +33,39 @@ export class HubSpotDealSyncService {
       properties.dealname = payload.dealName;
     }
 
-    const endpoint = dealId
-      ? `https://api.hubapi.com/crm/v3/objects/deals/${dealId}`
-      : 'https://api.hubapi.com/crm/v3/objects/deals';
+    const path = dealId
+      ? `/crm/v3/objects/deals/${dealId}`
+      : '/crm/v3/objects/deals';
 
-    const response = await fetch(endpoint, {
+    const { status, ok, data } = await this.httpClient.request<{
+      id?: string;
+      correlationId?: string;
+      category?: string;
+      message?: string;
+      errors?: unknown[];
+    }>({
+      tenantId,
+      path,
       method: dealId ? 'PATCH' : 'POST',
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ properties }),
+      body: { properties },
     });
 
-    if (!response.ok) {
-      const errorBody = (await response.json().catch(() => ({}))) as {
-        correlationId?: string;
-        category?: string;
-        message?: string;
-        errors?: unknown[];
-      };
-
+    if (!ok) {
       // Detect if HubSpot rejected the dealstage ID due to stale Redis cache
-      if (isHubSpotStaleStageError(response.status, errorBody)) {
+      if (isHubSpotStaleStageError(status, data)) {
         throw new StaleDealStageError(
           tenantId,
           pipelineId,
           payload.dealStage,
-          errorBody.correlationId,
+          data.correlationId,
         );
       }
 
       throw new Error(
-        `HubSpot Deals API failed (${response.status}): ${JSON.stringify(errorBody)}`,
+        `HubSpot Deals API failed (${status}): ${JSON.stringify(data)}`,
       );
     }
 
-    const result = (await response.json()) as { id: string };
-    return { dealId: result.id };
+    return { dealId: String(data.id) };
   }
 }

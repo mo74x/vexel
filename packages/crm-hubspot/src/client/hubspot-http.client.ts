@@ -23,7 +23,7 @@ export class HubSpotHttpClient {
     method?: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
     body?: Record<string, any>;
     isRetryAfter401?: boolean;
-  }): Promise<{ status: number; data: T; headers: Headers }> {
+  }): Promise<{ status: number; ok: boolean; data: T; headers: Headers }> {
     const { tenantId, path, method = 'GET', body, isRetryAfter401 = false } = params;
     const cooldownKey = this.getCooldownKey(tenantId);
 
@@ -82,6 +82,6 @@ export class HubSpotHttpClient {
     }
 
     const data = (await response.json().catch(() => ({}))) as T;
-    return { status: response.status, data, headers: response.headers };
+    return { status: response.status, ok: response.ok, data, headers: response.headers };
   }
 }

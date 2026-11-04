@@ -15,6 +15,7 @@
     "@nestjs/platform-express": "^12.3.2",
     "@prisma/client": "^7.10.1",
     "@vexel/anvil-engine": "workspace:*",
+    "@vexel/crm-hubspot": "workspace:*",
     "@vexel/database": "workspace:*",
     "@vexel/extractor": "workspace:*",
     "bullmq": "^6.5.3",
