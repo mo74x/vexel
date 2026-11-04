@@ -15,13 +15,17 @@
     "db:studio": "prisma studio"
   },
   "dependencies": {
+    "@nestjs/common": "^12.3.2",
     "@prisma/adapter-pg": "^7.10.1",
     "@prisma/client": "^7.10.1",
     "dotenv": "^18.0.9",
-    "pg": "^8.23.1"
+    "pg": "^8.23.1",
+    "reflect-metadata": "^0.2.2"
   },
   "devDependencies": {
+    "@types/node": "^26.6.6",
     "@types/pg": "^8.23.1",
+    "@vexel/crm-hubspot": "workspace:*",
     "prisma": "^7.10.1"
   }
 }

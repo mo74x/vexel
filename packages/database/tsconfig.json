@@ -1,11 +1,13 @@
 {
   "extends": "../../tsconfig.json",
   "compilerOptions": {
-    "outDir": "./dist",
-    "declaration": true,
-    "sourceMap": true
+    "noEmit": true,
+    "paths": {
+      "@nestjs/common": ["../../apps/worker-api/node_modules/@nestjs/common"],
+      "@vexel/crm-hubspot": ["../../packages/crm-hubspot/src/index.ts"],
+      "@vexel/extractor": ["../../packages/extractor/src/index.ts"]
+    }
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist"]
 }
-

@@ -5,6 +5,7 @@ node_modules/
 
 # pnpm
 .pnpm-debug.log*
+.agents
 
 # Build & TypeScript outputs
 dist/
