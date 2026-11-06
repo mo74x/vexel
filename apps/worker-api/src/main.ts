@@ -1,16 +1,18 @@
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
-import { Logger } from '@nestjs/common';
 import { AppModule } from './app.module';
+import { prisma } from '@vexel/database';
 
 async function bootstrap() {
-  const logger = new Logger('VexelWorkerApi');
   const app = await NestFactory.create(AppModule);
 
-  const port = Number(process.env.PORT || 3001);
-  await app.listen(port);
-  logger.log(`Vexel Worker API listening on port ${port}`);
+  // Ensures BullMQ workers drain active jobs before OnModuleDestroy closes Prisma & Redis
+  app.enableShutdownHooks();
+
+  process.on('beforeExit', async () => {
+    await prisma.$disconnect();
+  });
+
+  await app.listen(process.env.PORT || 3001);
 }
-
 bootstrap();
-

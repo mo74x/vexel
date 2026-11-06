@@ -146,11 +146,27 @@ export function createVexelSecurityExtension(basePrisma: PrismaClient) {
 
       return basePrisma.$transaction(
         async (rawTx) => {
-          // 1. Execute PostgreSQL RLS session configuration ONCE for the entire transaction
+          // Combine RLS tenant binding + transaction-scoped safety timeouts in ONE round-trip.
+          // Passing `true` (is_local) ensures every setting resets automatically on COMMIT/ROLLBACK,
+          // guaranteeing zero state leakage across PgBouncer transaction-mode connections.
           if (bypassRls) {
-            await rawTx.$executeRaw`SELECT set_config('app.bypass_rls', 'on', true), set_config('app.current_tenant_id', '', true)`;
+            await rawTx.$executeRaw`
+              SELECT
+                set_config('app.bypass_rls', 'on', true),
+                set_config('app.current_tenant_id', '', true),
+                set_config('statement_timeout', '8000', true),
+                set_config('idle_in_transaction_session_timeout', '10000', true),
+                set_config('lock_timeout', '4000', true)
+            `;
           } else {
-            await rawTx.$executeRaw`SELECT set_config('app.current_tenant_id', ${targetTenantId!}, true), set_config('app.bypass_rls', 'off', true)`;
+            await rawTx.$executeRaw`
+              SELECT
+                set_config('app.current_tenant_id', ${targetTenantId!}, true),
+                set_config('app.bypass_rls', 'off', true),
+                set_config('statement_timeout', '8000', true),
+                set_config('idle_in_transaction_session_timeout', '10000', true),
+                set_config('lock_timeout', '4000', true)
+            `;
           }
 
           // 2. Proxy raw SQL helpers ($executeRaw / $queryRaw) to rawTx while keeping model guards on `client`
@@ -179,8 +195,8 @@ export function createVexelSecurityExtension(basePrisma: PrismaClient) {
           );
         },
         {
-          maxWait: options?.maxWait ?? 5_000,
-          timeout: options?.timeout ?? 15_000,
+          maxWait: options?.maxWait ?? 15_000, // Matches pool_timeout headroom
+          timeout: options?.timeout ?? 10_000, // Hard ceiling for interactive transaction duration
           isolationLevel: options?.isolationLevel,
         },
       );
