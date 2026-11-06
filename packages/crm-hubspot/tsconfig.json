@@ -3,11 +3,12 @@
   "compilerOptions": {
     "noEmit": true,
     "paths": {
+      "@nestjs/common": ["../../apps/worker-api/node_modules/@nestjs/common"],
       "@prisma/client": ["../../packages/database/node_modules/@prisma/client"],
+      "@vexel/database": ["../../packages/database/src/index.ts"],
       "@vexel/extractor": ["../../packages/extractor/src/index.ts"]
     }
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist"]
 }
-

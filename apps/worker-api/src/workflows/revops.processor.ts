@@ -10,6 +10,7 @@ import {
   EnvelopeCryptoService,
   HubSpotEntityResolverService,
   HubSpotHttpClient,
+  HubSpotOwnerResolverService,
   HubSpotSyncOutcome,
   HubSpotTokenManagerService,
   HubSpotV4SyncService,
@@ -36,6 +37,7 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
   private readonly entityResolver: HubSpotEntityResolverService;
   private readonly whatsappApproval: WhatsAppApprovalService;
   private readonly hubspotV4Sync: HubSpotV4SyncService;
+  private readonly ownerResolver: HubSpotOwnerResolverService;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -58,6 +60,11 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
     this.entityResolver = new HubSpotEntityResolverService(httpClient);
     this.whatsappApproval = new WhatsAppApprovalService();
     this.hubspotV4Sync = new HubSpotV4SyncService(httpClient);
+    this.ownerResolver = new HubSpotOwnerResolverService(
+      this.prisma.client,
+      this.lockService.redis,
+      httpClient,
+    );
   }
 
   async process(job: Job, token?: string): Promise<any> {
@@ -320,14 +327,32 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
     payload: CrmTransitionPayload,
   ) {
     const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
+    const fallbackPhone =
+      tenant.fallbackApprovalPhone || process.env.DEFAULT_REP_APPROVAL_PHONE!;
+
+    // Resolve Deal/Contact Owner -> Rep's personal WhatsApp via Redis Hash cache (~0.4ms)
+    const ownerRoute = await this.ownerResolver.resolveApprovalDestination(
+      tenantId,
+      crmContext.contactOwnerId,
+      fallbackPhone,
+    );
+
+    // If routed to fallback admin because rep hasn't linked WhatsApp, prepend notice to reasoning
+    const enrichedPayload: CrmTransitionPayload = ownerRoute.isFallbackRoute
+      ? {
+          ...payload,
+          confidenceReasoning: `[Routed to Fallback — ${ownerRoute.fallbackReason}] ${payload.confidenceReasoning}`,
+        }
+      : payload;
+
     return this.whatsappApproval.sendRepApprovalCard({
       tenantId,
       runId,
       whatsappPhoneNumberId: tenant.whatsappPhoneId || process.env.WHATSAPP_PHONE_NUMBER_ID!,
       whatsappAccessToken: process.env.WHATSAPP_SYSTEM_TOKEN!,
-      repDestinationPhone: process.env.DEFAULT_REP_APPROVAL_PHONE!,
+      repDestinationPhone: ownerRoute.destinationWhatsappPhone,
       crmContext,
-      payload,
+      payload: enrichedPayload,
     });
   }
 

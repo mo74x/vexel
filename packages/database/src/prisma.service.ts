@@ -26,6 +26,10 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
     return this.client.tenant;
   }
 
+  get tenantRep() {
+    return this.client.tenantRep;
+  }
+
   get workflowRun() {
     return this.client.workflowRun;
   }

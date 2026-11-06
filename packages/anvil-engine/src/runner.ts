@@ -36,6 +36,7 @@ export class AnvilStepContext {
             attempt: { increment: 1 },
           },
           create: {
+            tenantId: this.tenantId,
             runId: this.runId,
             stepKey,
             status: StepStatus.COMPLETED,
@@ -69,6 +70,7 @@ export class AnvilStepContext {
             attempt: { increment: 1 },
           },
           create: {
+            tenantId: this.tenantId,
             runId: this.runId,
             stepKey,
             status: StepStatus.FAILED,

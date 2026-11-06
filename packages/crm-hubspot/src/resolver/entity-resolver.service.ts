@@ -136,6 +136,7 @@ export class HubSpotEntityResolverService {
           'dealstage',
           'amount',
           'pipeline',
+          'hubspot_owner_id',
           'hs_is_closed',
           'hs_lastmodifieddate',
         ],
@@ -156,10 +157,14 @@ export class HubSpotEntityResolverService {
     const primaryDeal = candidatePool[0];
     const dealProps = primaryDeal?.properties ?? {};
 
+    // Prioritize the Account Executive owning the Deal; fallback to SDR owning the Contact
+    const effectiveOwnerId =
+      dealProps.hubspot_owner_id ?? contactProps.hubspot_owner_id ?? null;
+
     return {
       contactId,
       contactName,
-      contactOwnerId: contactProps.hubspot_owner_id ?? null,
+      contactOwnerId: effectiveOwnerId ? String(effectiveOwnerId) : null,
       companyId,
       companyName: contactProps.company ?? null,
       activeDealId: primaryDeal ? String(primaryDeal.id) : null,

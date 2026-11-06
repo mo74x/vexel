@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@prisma/client": "^7.10.1",
+    "@vexel/database": "workspace:*",
     "@vexel/extractor": "workspace:*",
     "ioredis": "^6.0.0"
   },

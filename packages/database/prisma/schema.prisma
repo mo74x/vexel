@@ -29,12 +29,30 @@ model Tenant {
   hubspotAccessToken  String?
   hubspotRefreshToken String?
   hubspotTokenExpires DateTime?
+  fallbackApprovalPhone String?
   whatsappPhoneId     String?        @unique
   autoSyncThreshold   Int            @default(85) // Confidence % threshold
   createdAt           DateTime       @default(now())
   updatedAt           DateTime       @updatedAt
   workflowRuns        WorkflowRun[]
   usageLedgers        UsageLedger[]
+  tenantReps          TenantRep[]
+}
+
+model TenantRep {
+  id             String   @id @default(cuid())
+  tenantId       String
+  tenant         Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  hubspotOwnerId String   // HubSpot v3 Owner ID (e.g., "74829104")
+  email          String   // Lowercase corporate email from /crm/v3/owners
+  fullName       String
+  whatsappPhone  String?  // E.164 WhatsApp number (e.g., "+201012345678")
+  isActive       Boolean  @default(true)
+  updatedAt      DateTime @updatedAt
+
+  @@unique([tenantId, hubspotOwnerId])
+  @@unique([tenantId, email])
+  @@index([tenantId, whatsappPhone])
 }
 
 model WorkflowRun {

@@ -28,6 +28,7 @@ export class CrossTenantAccessError extends Error {
 }
 
 const TENANT_SCOPED_MODELS = new Set([
+  'TenantRep',
   'WorkflowRun',
   'WorkflowStep',
   'UsageLedger',

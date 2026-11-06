@@ -11,17 +11,41 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { createHash } from 'crypto';
 import { VexelLockService, InboundEventPayload } from '../redis/vexel-lock.service';
-import { WhatsAppApprovalService } from '@vexel/crm-hubspot';
+import {
+  EnvelopeCryptoService,
+  HubSpotHttpClient,
+  HubSpotOwnerResolverService,
+  HubSpotTokenManagerService,
+  WhatsAppApprovalService,
+} from '@vexel/crm-hubspot';
+import { PrismaClient } from '@prisma/client';
+import { PrismaService, TenantContext } from '@vexel/database';
 
 @Controller('v1/webhooks')
 export class WebhooksController {
   private readonly DEBOUNCE_WINDOW_MS = 30_000; // 30-second sliding window
   private readonly whatsappApproval = new WhatsAppApprovalService();
+  private readonly ownerResolver: HubSpotOwnerResolverService;
 
   constructor(
+    private readonly prisma: PrismaService,
     private readonly lockService: VexelLockService,
     @InjectQueue('vexel-workflows') private readonly workflowQueue: Queue,
-  ) {}
+  ) {
+    const rawPrisma = this.prisma.client as unknown as PrismaClient;
+    const envelopeCrypto = new EnvelopeCryptoService();
+    const tokenManager = new HubSpotTokenManagerService(
+      rawPrisma,
+      this.lockService.redis,
+      envelopeCrypto,
+    );
+    const httpClient = new HubSpotHttpClient(this.lockService.redis, tokenManager);
+    this.ownerResolver = new HubSpotOwnerResolverService(
+      this.prisma.client,
+      this.lockService.redis,
+      httpClient,
+    );
+  }
 
   @Post(':tenantId/ingest')
   @HttpCode(202)
@@ -48,6 +72,20 @@ export class WebhooksController {
     const payload = this.normalizePayload(body);
     if (!payload) {
       return { status: 'ignored_non_message_event' };
+    }
+    if (payload.type === 'text' && payload.text?.trim().toLowerCase().startsWith('/link ')) {
+      const emailToBind = payload.text.trim().slice(6).trim();
+      const bound = await TenantContext.run(tenantId, () =>
+        this.ownerResolver.bindRepWhatsAppByEmail(
+          tenantId,
+          emailToBind,
+          payload.senderPhone,
+        ),
+      );
+      return {
+        status: bound ? 'rep_whatsapp_linked' : 'rep_email_not_found_in_hubspot',
+        owner: bound,
+      };
     }
 
     // 2. Fast SHA-256 edge deduplication
