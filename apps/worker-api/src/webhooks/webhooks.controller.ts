@@ -11,10 +11,12 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { createHash } from 'crypto';
 import { VexelLockService, InboundEventPayload } from '../redis/vexel-lock.service';
+import { WhatsAppApprovalService } from '@vexel/crm-hubspot';
 
 @Controller('v1/webhooks')
 export class WebhooksController {
   private readonly DEBOUNCE_WINDOW_MS = 30_000; // 30-second sliding window
+  private readonly whatsappApproval = new WhatsAppApprovalService();
 
   constructor(
     private readonly lockService: VexelLockService,
@@ -28,6 +30,20 @@ export class WebhooksController {
     @Headers('x-hub-signature-256') signature: string,
     @Body() body: any,
   ) {
+    const rawMsg = body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    const buttonReplyId = rawMsg?.interactive?.button_reply?.id;
+
+    if (buttonReplyId && buttonReplyId.startsWith('vexel_act:')) {
+      const verified = this.whatsappApproval.verifyAndParseButtonReply(buttonReplyId);
+      if (verified) {
+        return this.handleRepApproval({
+          tenantId: verified.tenantId,
+          runId: verified.runId,
+          approved: verified.action === 'approve',
+        });
+      }
+    }
+
     // 1. Normalize incoming WhatsApp / Voice payload
     const payload = this.normalizePayload(body);
     if (!payload) {

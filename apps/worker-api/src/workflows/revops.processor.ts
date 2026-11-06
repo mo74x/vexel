@@ -8,16 +8,19 @@ import { VexelLockService } from '../redis/vexel-lock.service';
 import { AnvilStepContext } from '@vexel/anvil-engine';
 import {
   EnvelopeCryptoService,
-  HubSpotDealSyncService,
+  HubSpotEntityResolverService,
   HubSpotHttpClient,
+  HubSpotSyncOutcome,
   HubSpotTokenManagerService,
+  HubSpotV4SyncService,
+  ResolvedHubSpotContext,
+  WhatsAppApprovalService,
 } from '@vexel/crm-hubspot';
 import {
   BilingualTranscriberService,
   CrmTransitionPayload,
   MergedTranscriptBundle,
   PipelineStageCacheService,
-  ResolvedCrmContext,
   UsageMeterService,
   ZodExtractorService,
 } from '@vexel/extractor';
@@ -30,7 +33,9 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
   private readonly zodExtractor: ZodExtractorService;
   private readonly stageCache: PipelineStageCacheService;
   private readonly tokenManager: HubSpotTokenManagerService;
-  private readonly dealSync: HubSpotDealSyncService;
+  private readonly entityResolver: HubSpotEntityResolverService;
+  private readonly whatsappApproval: WhatsAppApprovalService;
+  private readonly hubspotV4Sync: HubSpotV4SyncService;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -50,7 +55,9 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
       envelopeCrypto,
     );
     const httpClient = new HubSpotHttpClient(this.lockService.redis, this.tokenManager);
-    this.dealSync = new HubSpotDealSyncService(httpClient);
+    this.entityResolver = new HubSpotEntityResolverService(httpClient);
+    this.whatsappApproval = new WhatsAppApprovalService();
+    this.hubspotV4Sync = new HubSpotV4SyncService(httpClient);
   }
 
   async process(job: Job, token?: string): Promise<any> {
@@ -134,7 +141,7 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
                   confidenceScore: extraction.confidenceScore,
                 },
               });
-              return this.sendInteractiveApprovalPrompt(tenantId, run.id, finalPayload);
+              return this.sendInteractiveApprovalPrompt(tenantId, run.id, crmContext, finalPayload);
             });
 
             this.logger.log(`Run ${run.id} paused in WAITING_APPROVAL (Confidence: ${extraction.confidenceScore}%)`);
@@ -142,10 +149,16 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
           }
 
           // STEP 5: Idempotent HubSpot v4 Batch Sync with Stale-Stage Recovery
-          let syncResult: { dealId: string };
+          let syncResult: HubSpotSyncOutcome;
           try {
             syncResult = await anvil.run('step-5-sync-hubspot-v4', async () => {
-              return this.syncToHubSpotV4(tenantId, run.id, crmContext, finalPayload);
+              return this.syncToHubSpotV4(
+                tenantId,
+                run.id,
+                transcriptBundle.senderPhone,
+                crmContext,
+                finalPayload,
+              );
             });
           } catch (err: any) {
             if (err?.isStaleDealStage === true || err?.name === 'StaleDealStageError') {
@@ -278,26 +291,15 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
     );
   }
 
-  private async resolveHubSpotEntities(
-    tenantId: string,
-    senderPhone: string,
-  ): Promise<ResolvedCrmContext> {
-    return {
-      contactId: null,
-      contactName: null,
-      companyName: null,
-      activeDealId: null,
-      currentDealName: null,
-      currentDealStage: null,
-      currentAmount: null,
-    };
+  private async resolveHubSpotEntities(tenantId: string, senderPhone: string) {
+    return this.entityResolver.resolveBySenderPhone(tenantId, senderPhone);
   }
 
   private async extractCrmTransitionWithZod(
     tenantId: string,
     runId: string,
     bundle: MergedTranscriptBundle,
-    crmContext: ResolvedCrmContext,
+    crmContext: ResolvedHubSpotContext,
   ) {
     let hubspotAccessToken: string | null = null;
     try {
@@ -311,20 +313,36 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
     return this.zodExtractor.extractTransition(tenantId, runId, hubspotAccessToken, bundle, crmContext);
   }
 
-  private async sendInteractiveApprovalPrompt(tenantId: string, runId: string, payload: any) {
-    return { messageDispatched: true };
+  private async sendInteractiveApprovalPrompt(
+    tenantId: string,
+    runId: string,
+    crmContext: ResolvedHubSpotContext,
+    payload: CrmTransitionPayload,
+  ) {
+    const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
+    return this.whatsappApproval.sendRepApprovalCard({
+      tenantId,
+      runId,
+      whatsappPhoneNumberId: tenant.whatsappPhoneId || process.env.WHATSAPP_PHONE_NUMBER_ID!,
+      whatsappAccessToken: process.env.WHATSAPP_SYSTEM_TOKEN!,
+      repDestinationPhone: process.env.DEFAULT_REP_APPROVAL_PHONE!,
+      crmContext,
+      payload,
+    });
   }
 
   private async syncToHubSpotV4(
     tenantId: string,
     runId: string,
-    crm: ResolvedCrmContext,
+    senderPhone: string,
+    crmContext: ResolvedHubSpotContext,
     payload: CrmTransitionPayload,
   ) {
-    return this.dealSync.upsertDealProperties({
+    return this.hubspotV4Sync.syncTransitionIdempotently({
       tenantId,
-      dealId: crm.activeDealId,
-      pipelineId: crm.pipelineId ?? 'default',
+      runId,
+      senderPhone,
+      crmContext,
       payload,
     });
   }
