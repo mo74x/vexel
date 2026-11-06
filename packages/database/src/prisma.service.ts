@@ -1,9 +1,12 @@
 import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
-import { encryptedTokenGuardExtension } from './extensions/encrypted-token-guard.extension';
+import {
+  createVexelSecurityExtension,
+  TenantTransactionOptions,
+} from './guards/tenant-rls.guard';
 
-function createGuardedPrismaClient() {
-  return new PrismaClient().$extends(encryptedTokenGuardExtension);
+function createGuardedPrismaClient(base: PrismaClient) {
+  return base.$extends(createVexelSecurityExtension(base));
 }
 
 // Export the exact inferred type so services can type-hint `GuardedPrismaClient`
@@ -15,7 +18,7 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
   public readonly client: GuardedPrismaClient;
 
   constructor() {
-    this.client = this.baseClient.$extends(encryptedTokenGuardExtension);
+    this.client = createGuardedPrismaClient(this.baseClient);
   }
 
   // Convenience getters so existing `this.prisma.tenant.update(...)` calls work seamlessly
@@ -33,6 +36,10 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
 
   get usageLedger() {
     return this.client.usageLedger;
+  }
+
+  get $withTenantTransaction() {
+    return this.client.$withTenantTransaction;
   }
 
   async onModuleInit() {

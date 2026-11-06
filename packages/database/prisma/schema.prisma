@@ -61,17 +61,19 @@ model WorkflowRun {
 
 model WorkflowStep {
   id          String      @id @default(cuid())
+  tenantId    String      // Denormalized for zero-join PostgreSQL RLS enforcement
   runId       String
   run         WorkflowRun @relation(fields: [runId], references: [id], onDelete: Cascade)
-  stepKey     String      // e.g., "transcribe-audio", "extract-zod", "sync-hubspot"
+  stepKey     String
   attempt     Int         @default(1)
   status      StepStatus  @default(PENDING)
-  outputData  Json?       // Cached step result for deterministic replay
+  outputData  Json?
   errorLog    String?
   durationMs  Int?
   executedAt  DateTime    @default(now())
 
-  @@unique([runId, stepKey]) // Guarantees deterministic replay cache lookup
+  @@unique([runId, stepKey])
+  @@index([tenantId, runId])
 }
 
 model UsageLedger {

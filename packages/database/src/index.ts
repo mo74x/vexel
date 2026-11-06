@@ -1,12 +1,13 @@
 import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
-import { encryptedTokenGuardExtension } from "./extensions/encrypted-token-guard.extension";
+import { createVexelSecurityExtension } from "./guards/tenant-rls.guard";
 
 const connectionString = process.env.DATABASE_URL!;
 const adapter = new PrismaPg({ connectionString });
 
 function createExtendedPrisma() {
-  return new PrismaClient({ adapter }).$extends(encryptedTokenGuardExtension);
+  const base = new PrismaClient({ adapter });
+  return base.$extends(createVexelSecurityExtension(base));
 }
 
 const globalForPrisma = globalThis as unknown as {
@@ -20,6 +21,8 @@ if (process.env.NODE_ENV !== "production") {
 }
 
 export * from "@prisma/client";
+export * from "./context/tenant-context";
+export * from "./guards/tenant-rls.guard";
 export * from "./extensions/encrypted-token-guard.extension";
 export {
   assertEncryptedTokenPayloads,

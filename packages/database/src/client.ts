@@ -1,12 +1,12 @@
 import { PrismaClient } from '@prisma/client';
-import { vexelEncryptedTokenGuard } from './guards/token-envelope.guard';
+import { createVexelSecurityExtension } from './guards/tenant-rls.guard';
 
 function createExtendedPrismaClient() {
   const baseClient = new PrismaClient({
     log: process.env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'],
   });
 
-  return baseClient.$extends(vexelEncryptedTokenGuard);
+  return baseClient.$extends(createVexelSecurityExtension(baseClient));
 }
 
 // Export the inferred type for NestJS Dependency Injection

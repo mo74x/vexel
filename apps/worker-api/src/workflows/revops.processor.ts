@@ -2,7 +2,7 @@ import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job, DelayedError, UnrecoverableError } from 'bullmq';
 import { Logger } from '@nestjs/common';
 import { PrismaClient, RunStatus } from '@prisma/client';
-import { PrismaService } from '@vexel/database';
+import { PrismaService, TenantContext } from '@vexel/database';
 import { createHash } from 'crypto';
 import { VexelLockService } from '../redis/vexel-lock.service';
 import { AnvilStepContext } from '@vexel/anvil-engine';
@@ -25,6 +25,7 @@ import {
 @Processor('vexel-workflows', { concurrency: 10 })
 export class RevOpsWorkflowProcessor extends WorkerHost {
   private readonly logger = new Logger(RevOpsWorkflowProcessor.name);
+  private readonly usageMeter: UsageMeterService;
   private readonly bilingualTranscriber: BilingualTranscriberService;
   private readonly zodExtractor: ZodExtractorService;
   private readonly stageCache: PipelineStageCacheService;
@@ -37,10 +38,10 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
   ) {
     super();
     const rawPrisma = this.prisma.client as unknown as PrismaClient;
-    const usageMeter = new UsageMeterService(rawPrisma);
-    this.bilingualTranscriber = new BilingualTranscriberService(usageMeter);
+    this.usageMeter = new UsageMeterService(rawPrisma);
+    this.bilingualTranscriber = new BilingualTranscriberService(this.usageMeter);
     this.stageCache = new PipelineStageCacheService(this.lockService.redis);
-    this.zodExtractor = new ZodExtractorService(usageMeter, this.stageCache);
+    this.zodExtractor = new ZodExtractorService(this.usageMeter, this.stageCache);
 
     const envelopeCrypto = new EnvelopeCryptoService();
     this.tokenManager = new HubSpotTokenManagerService(
@@ -54,159 +55,179 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
 
   async process(job: Job, token?: string): Promise<any> {
     const { tenantId, senderPhone, mode, runId: existingRunId, approved, editedPatch } = job.data;
-    const lockEntityKey = senderPhone || existingRunId;
 
-    // 1. Acquire Distributed Redis Deal/Contact Lock
-    const lockToken = await this.lockService.acquireDealLock(tenantId, lockEntityKey, 45000);
-    if (!lockToken) {
-      this.logger.warn(`Lock contention on ${lockEntityKey}; delaying job by 5s without burning attempt.`);
-      await job.moveToDelayed(Date.now() + 5000, token);
-      throw new DelayedError();
-    }
+    // Bind tenantId to AsyncLocalStorage for the entire lifecycle of this BullMQ job
+    return TenantContext.run(tenantId, async () => {
+      // Every prisma.workflowRun, prisma.workflowStep, and prisma.usageLedger query
+      // inside this callback automatically injects tenantId and enforces PostgreSQL RLS!
+      const lockEntityKey = senderPhone || existingRunId;
 
-    // Start background lock heartbeat every 15s while job runs
-    const heartbeat = setInterval(() => {
-      this.lockService.extendDealLock(tenantId, lockEntityKey, lockToken, 45000);
-    }, 15000);
-
-    try {
-      // 2. Initialize or Load Durable WorkflowRun
-      const run = await this.getOrCreateWorkflowRun(tenantId, senderPhone, existingRunId, job.id!);
-      if (!run) {
-        return { status: 'empty_buffer_skipped' };
+      // 1. Acquire Distributed Redis Deal/Contact Lock
+      const lockToken = await this.lockService.acquireDealLock(tenantId, lockEntityKey, 45000);
+      if (!lockToken) {
+        this.logger.warn(`Lock contention on ${lockEntityKey}; delaying job by 5s without burning attempt.`);
+        await job.moveToDelayed(Date.now() + 5000, token);
+        throw new DelayedError();
       }
 
-      const anvil = new AnvilStepContext(
-        this.prisma.client as unknown as PrismaClient,
-        run.id,
-        tenantId,
-      );
-
-      // Handle Rep Rejection if resuming from approval
-      if (mode === 'RESUME_AFTER_APPROVAL' && approved === false) {
-        await this.prisma.workflowRun.update({
-          where: { id: run.id },
-          data: { status: RunStatus.COMPLETED, completedAt: new Date() },
-        });
-        return { status: 'rejected_by_rep', runId: run.id };
-      }
+      // Start background lock heartbeat every 15s while job runs
+      const heartbeat = setInterval(() => {
+        this.lockService.extendDealLock(tenantId, lockEntityKey, lockToken, 45000);
+      }, 15000);
 
       try {
-        // STEP 1: Transcribe Audio & Merge Conversation Window
-        const transcriptBundle = await anvil.run('step-1-transcribe-window', async () => {
-          const messages = (run.inputPayload as any).messages as any[];
-          // Calls Deepgram/Whisper for audio items & logs audioSeconds to UsageLedger
-          return this.transcribeAndMergeBatch(tenantId, run.id, messages);
-        });
-
-        // STEP 2: Deterministic HubSpot Contact & Active Deal Resolution
-        const crmContext = await anvil.run('step-2-resolve-hubspot-entities', async () => {
-          return this.resolveHubSpotEntities(tenantId, transcriptBundle.senderPhone);
-        });
-
-        // STEP 3: Schema-Validated LLM Extraction + Token Metering
-        const extraction = await anvil.run('step-3-extract-zod-schema', async () => {
-          return this.extractCrmTransitionWithZod(tenantId, run.id, transcriptBundle, crmContext);
-        });
-
-        // Apply manual rep edits if resuming from WhatsApp approval card
-        const finalPayload = editedPatch ? { ...extraction, ...editedPatch } : extraction;
-
-        // STEP 4: Confidence Gate & Human-in-the-Loop Pause
-        const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
-        const needsApproval =
-          mode !== 'RESUME_AFTER_APPROVAL' &&
-          extraction.confidenceScore <= tenant.autoSyncThreshold;
-
-        if (needsApproval) {
-          await anvil.run('step-4-dispatch-approval-prompt', async () => {
-            await this.prisma.workflowRun.update({
-              where: { id: run.id },
-              data: {
-                status: RunStatus.WAITING_APPROVAL,
-                extractedData: finalPayload,
-                confidenceScore: extraction.confidenceScore,
-              },
-            });
-            return this.sendInteractiveApprovalPrompt(tenantId, run.id, finalPayload);
-          });
-
-          this.logger.log(`Run ${run.id} paused in WAITING_APPROVAL (Confidence: ${extraction.confidenceScore}%)`);
-          return { status: 'paused_waiting_for_approval', runId: run.id };
+        // 2. Initialize or Load Durable WorkflowRun
+        const run = await this.getOrCreateWorkflowRun(tenantId, senderPhone, existingRunId, job.id!);
+        if (!run) {
+          return { status: 'empty_buffer_skipped' };
         }
 
-        // STEP 5: Idempotent HubSpot v4 Batch Sync with Stale-Stage Recovery
-        let syncResult: { dealId: string };
-        try {
-          syncResult = await anvil.run('step-5-sync-hubspot-v4', async () => {
-            return this.syncToHubSpotV4(tenantId, run.id, crmContext, finalPayload);
+        const anvil = new AnvilStepContext(
+          this.prisma.client,
+          run.id,
+          tenantId,
+        );
+
+        // Handle Rep Rejection if resuming from approval
+        if (mode === 'RESUME_AFTER_APPROVAL' && approved === false) {
+          await this.prisma.workflowRun.update({
+            where: { id: run.id },
+            data: { status: RunStatus.COMPLETED, completedAt: new Date() },
           });
+          return { status: 'rejected_by_rep', runId: run.id };
+        }
+
+        try {
+          // STEP 1: Transcribe Audio & Merge Conversation Window
+          const transcriptBundle = await anvil.run('step-1-transcribe-window', async () => {
+            const messages = (run.inputPayload as any).messages as any[];
+            // Calls Deepgram/Whisper for audio items & logs audioSeconds to UsageLedger
+            return this.transcribeAndMergeBatch(tenantId, run.id, messages);
+          });
+
+          // STEP 2: Deterministic HubSpot Contact & Active Deal Resolution
+          const crmContext = await anvil.run('step-2-resolve-hubspot-entities', async () => {
+            return this.resolveHubSpotEntities(tenantId, transcriptBundle.senderPhone);
+          });
+
+          // STEP 3: Schema-Validated LLM Extraction + Token Metering
+          const extraction = await anvil.run('step-3-extract-zod-schema', async () => {
+            return this.extractCrmTransitionWithZod(tenantId, run.id, transcriptBundle, crmContext);
+          });
+
+          // Apply manual rep edits if resuming from WhatsApp approval card
+          const finalPayload = editedPatch ? { ...extraction, ...editedPatch } : extraction;
+
+          // STEP 4: Confidence Gate & Human-in-the-Loop Pause
+          const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
+          const needsApproval =
+            mode !== 'RESUME_AFTER_APPROVAL' &&
+            extraction.confidenceScore <= tenant.autoSyncThreshold;
+
+          if (needsApproval) {
+            await anvil.run('step-4-dispatch-approval-prompt', async () => {
+              await this.prisma.workflowRun.update({
+                where: { id: run.id },
+                data: {
+                  status: RunStatus.WAITING_APPROVAL,
+                  extractedData: finalPayload,
+                  confidenceScore: extraction.confidenceScore,
+                },
+              });
+              return this.sendInteractiveApprovalPrompt(tenantId, run.id, finalPayload);
+            });
+
+            this.logger.log(`Run ${run.id} paused in WAITING_APPROVAL (Confidence: ${extraction.confidenceScore}%)`);
+            return { status: 'paused_waiting_for_approval', runId: run.id };
+          }
+
+          // STEP 5: Idempotent HubSpot v4 Batch Sync with Stale-Stage Recovery
+          let syncResult: { dealId: string };
+          try {
+            syncResult = await anvil.run('step-5-sync-hubspot-v4', async () => {
+              return this.syncToHubSpotV4(tenantId, run.id, crmContext, finalPayload);
+            });
+          } catch (err: any) {
+            if (err?.isStaleDealStage === true || err?.name === 'StaleDealStageError') {
+              const pipelineId = crmContext.pipelineId ?? 'default';
+
+              this.logger.warn(
+                `[Self-Healing] Stale HubSpot dealstage "${finalPayload.dealStage}" detected on run ${run.id}. Evicting Redis pipeline cache & Step 3 output...`,
+              );
+
+              // 1. Purge stale custom stages from Redis so next run fetches live from HubSpot
+              await this.stageCache.invalidateTenantStages(tenantId, pipelineId);
+
+              // 2. Evict Step 3, 4, and 5 from Anvil PG step cache (preserving Step 1 Audio & Step 2 CRM lookup)
+              await anvil.invalidateSteps(
+                [
+                  'step-3-extract-zod-schema',
+                  'step-4-dispatch-approval-prompt',
+                  'step-5-sync-hubspot-v4',
+                ],
+                `Stale HubSpot stage ID "${finalPayload.dealStage}" rejected by API`,
+              );
+            }
+
+            throw err;
+          }
+
+          // Commit final workflow state + audit usage in 1 RLS-pinned transaction
+          await this.prisma.$withTenantTransaction(async (tx) => {
+            // 1. Uses `tx` explicitly
+            await tx.workflowRun.update({
+              where: { id: run.id },
+              data: {
+                status: RunStatus.COMPLETED,
+                externalDealId: syncResult.dealId,
+                extractedData: finalPayload as any,
+                confidenceScore: finalPayload.confidenceScore,
+                completedAt: new Date(),
+              },
+            });
+
+            // 2. Ambiently reuses the exact same PostgreSQL connection & set_config session
+            // even though UsageMeterService calls `this.prisma.usageLedger.create()` internally!
+            await this.usageMeter.recordLlmUsage({
+              tenantId,
+              runId: run.id,
+              provider: 'hubspot-v4-sync-commit',
+              promptTokens: 0,
+              completionTokens: 0,
+            });
+          });
+
+          return { status: 'completed', runId: run.id, dealId: syncResult.dealId };
         } catch (err: any) {
-          if (err?.isStaleDealStage === true || err?.name === 'StaleDealStageError') {
-            const pipelineId = crmContext.pipelineId ?? 'default';
-
+          // 1. Rate-Limit Backpressure: Delay BullMQ job without burning an attempt
+          if (err?.isRateLimitError === true || err?.name === 'HubSpotRateLimitError') {
+            const retryAfterMs = Number(err.retryAfterMs) || 10_000;
             this.logger.warn(
-              `[Self-Healing] Stale HubSpot dealstage "${finalPayload.dealStage}" detected on run ${run.id}. Evicting Redis pipeline cache & Step 3 output...`,
+              `[Rate-Limit Backoff] Tenant ${tenantId} paused for ${retryAfterMs}ms (${err.message})`,
             );
+            await job.moveToDelayed(Date.now() + retryAfterMs, token);
+            throw new DelayedError();
+          }
 
-            // 1. Purge stale custom stages from Redis so next run fetches live from HubSpot
-            await this.stageCache.invalidateTenantStages(tenantId, pipelineId);
-
-            // 2. Evict Step 3, 4, and 5 from Anvil PG step cache (preserving Step 1 Audio & Step 2 CRM lookup)
-            await anvil.invalidateSteps(
-              [
-                'step-3-extract-zod-schema',
-                'step-4-dispatch-approval-prompt',
-                'step-5-sync-hubspot-v4',
-              ],
-              `Stale HubSpot stage ID "${finalPayload.dealStage}" rejected by API`,
-            );
+          // 2. Permanent OAuth Revocation: Move run to DEAD_LETTER and skip remaining BullMQ attempts
+          if (err?.isPermanentOAuthError === true || err?.name === 'HubSpotOAuthRevokedError') {
+            await this.prisma.workflowRun.updateMany({
+              where: { id: run.id },
+              data: {
+                status: RunStatus.DEAD_LETTER,
+                errorMessage: err.message,
+              },
+            });
+            throw new UnrecoverableError(err.message);
           }
 
           throw err;
         }
-
-        await this.prisma.workflowRun.update({
-          where: { id: run.id },
-          data: {
-            status: RunStatus.COMPLETED,
-            externalDealId: syncResult.dealId,
-            extractedData: finalPayload,
-            confidenceScore: extraction.confidenceScore,
-            completedAt: new Date(),
-          },
-        });
-
-        return { status: 'completed', runId: run.id, dealId: syncResult.dealId };
-      } catch (err: any) {
-        // 1. Rate-Limit Backpressure: Delay BullMQ job without burning an attempt
-        if (err?.isRateLimitError === true || err?.name === 'HubSpotRateLimitError') {
-          const retryAfterMs = Number(err.retryAfterMs) || 10_000;
-          this.logger.warn(
-            `[Rate-Limit Backoff] Tenant ${tenantId} paused for ${retryAfterMs}ms (${err.message})`,
-          );
-          await job.moveToDelayed(Date.now() + retryAfterMs, token);
-          throw new DelayedError();
-        }
-
-        // 2. Permanent OAuth Revocation: Move run to DEAD_LETTER and skip remaining BullMQ attempts
-        if (err?.isPermanentOAuthError === true || err?.name === 'HubSpotOAuthRevokedError') {
-          await this.prisma.workflowRun.updateMany({
-            where: { id: run.id },
-            data: {
-              status: RunStatus.DEAD_LETTER,
-              errorMessage: err.message,
-            },
-          });
-          throw new UnrecoverableError(err.message);
-        }
-
-        throw err;
+      } finally {
+        clearInterval(heartbeat);
+        await this.lockService.releaseDealLock(tenantId, lockEntityKey, lockToken);
       }
-    } finally {
-      clearInterval(heartbeat);
-      await this.lockService.releaseDealLock(tenantId, lockEntityKey, lockToken);
-    }
+    });
   }
 
   private async getOrCreateWorkflowRun(
