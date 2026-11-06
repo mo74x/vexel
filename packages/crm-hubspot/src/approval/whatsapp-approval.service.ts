@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from 'crypto';
+import Redis from 'ioredis';
 import { CrmTransitionPayload } from '@vexel/extractor';
 import { ResolvedHubSpotContext } from '../resolver/entity-resolver.service';
 
@@ -8,8 +9,27 @@ export interface ParsedButtonApproval {
   runId: string;
 }
 
+export interface PendingApprovalPointer {
+  tenantId: string;
+  runId: string;
+  repPhone: string;
+  whatsappMessageId: string;
+}
+
 export class WhatsAppApprovalService {
   private readonly GRAPH_API_VERSION = 'v21.0';
+  private readonly SESSION_TTL_SECONDS = 24 * 3600; // 24-hour approval window
+
+  constructor(private readonly redis: Redis) {}
+
+  private getMsgPointerKey(whatsappMessageId: string): string {
+    return `vexel:wa:msg:${whatsappMessageId}`;
+  }
+
+  private getRepPointerKey(tenantId: string, repPhone: string): string {
+    const digits = repPhone.replace(/\D/g, '');
+    return `vexel:wa:rep:${tenantId}:${digits}`;
+  }
 
   private signButtonPayload(action: 'approve' | 'reject', tenantId: string, runId: string): string {
     const secret = process.env.VEXEL_APPROVAL_HMAC_SECRET || 'dev_approval_secret';
@@ -45,6 +65,66 @@ export class WhatsAppApprovalService {
     }
 
     return { action: rawAction, tenantId, runId };
+  }
+
+  /**
+   * Call immediately after sendRepApprovalCard() receives the wamid from Meta Graph API
+   */
+  async registerPendingApprovalSession(pointer: PendingApprovalPointer): Promise<void> {
+    const serialized = JSON.stringify(pointer);
+    const pipeline = this.redis.pipeline();
+
+    // 1. Bind exact WhatsApp message ID for swipe-to-reply correlation
+    pipeline.set(
+      this.getMsgPointerKey(pointer.whatsappMessageId),
+      serialized,
+      'EX',
+      this.SESSION_TTL_SECONDS,
+    );
+
+    // 2. Bind rep's phone number for unquoted quick-reply correlation
+    pipeline.set(
+      this.getRepPointerKey(pointer.tenantId, pointer.repPhone),
+      serialized,
+      'EX',
+      this.SESSION_TTL_SECONDS,
+    );
+
+    await pipeline.exec();
+  }
+
+  /**
+   * Checks if an incoming text message is from a sales rep replying to a paused run.
+   * Prioritizes exact quoted context.id (wamid), falling back to the rep's active session.
+   */
+  async resolveRepOverrideTarget(
+    tenantId: string,
+    senderPhone: string,
+    quotedWhatsappMessageId?: string,
+  ): Promise<PendingApprovalPointer | null> {
+    if (quotedWhatsappMessageId) {
+      const byQuote = await this.redis.get(this.getMsgPointerKey(quotedWhatsappMessageId));
+      if (byQuote) {
+        return JSON.parse(byQuote) as PendingApprovalPointer;
+      }
+    }
+
+    const byRepPhone = await this.redis.get(this.getRepPointerKey(tenantId, senderPhone));
+    if (byRepPhone) {
+      return JSON.parse(byRepPhone) as PendingApprovalPointer;
+    }
+
+    return null;
+  }
+
+  /**
+   * Atomically clears the pending approval session once approved, rejected, or patched
+   */
+  async consumeApprovalSession(pointer: PendingApprovalPointer): Promise<void> {
+    await this.redis.del(
+      this.getMsgPointerKey(pointer.whatsappMessageId),
+      this.getRepPointerKey(pointer.tenantId, pointer.repPhone),
+    );
   }
 
   /**

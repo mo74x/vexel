@@ -22,6 +22,7 @@ import {
   CrmTransitionPayload,
   MergedTranscriptBundle,
   PipelineStageCacheService,
+  RepOverrideParserService,
   UsageMeterService,
   ZodExtractorService,
 } from '@vexel/extractor';
@@ -38,6 +39,7 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
   private readonly whatsappApproval: WhatsAppApprovalService;
   private readonly hubspotV4Sync: HubSpotV4SyncService;
   private readonly ownerResolver: HubSpotOwnerResolverService;
+  private readonly overrideParser: RepOverrideParserService;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -49,6 +51,7 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
     this.bilingualTranscriber = new BilingualTranscriberService(this.usageMeter);
     this.stageCache = new PipelineStageCacheService(this.lockService.redis);
     this.zodExtractor = new ZodExtractorService(this.usageMeter, this.stageCache);
+    this.overrideParser = new RepOverrideParserService(this.usageMeter);
 
     const envelopeCrypto = new EnvelopeCryptoService();
     this.tokenManager = new HubSpotTokenManagerService(
@@ -58,7 +61,7 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
     );
     const httpClient = new HubSpotHttpClient(this.lockService.redis, this.tokenManager);
     this.entityResolver = new HubSpotEntityResolverService(httpClient);
-    this.whatsappApproval = new WhatsAppApprovalService();
+    this.whatsappApproval = new WhatsAppApprovalService(this.lockService.redis);
     this.hubspotV4Sync = new HubSpotV4SyncService(httpClient);
     this.ownerResolver = new HubSpotOwnerResolverService(
       this.prisma.client,
@@ -68,7 +71,7 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
   }
 
   async process(job: Job, token?: string): Promise<any> {
-    const { tenantId, senderPhone, mode, runId: existingRunId, approved, editedPatch } = job.data;
+    const { tenantId, senderPhone, mode, runId: existingRunId, approved, editedPatch, rawRepOverrideText } = job.data;
 
     // Bind tenantId to AsyncLocalStorage for the entire lifecycle of this BullMQ job
     return TenantContext.run(tenantId, async () => {
@@ -130,7 +133,37 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
           });
 
           // Apply manual rep edits if resuming from WhatsApp approval card
-          const finalPayload = editedPatch ? { ...extraction, ...editedPatch } : extraction;
+          let finalPayload = editedPatch ? { ...extraction, ...editedPatch } : extraction;
+
+          if (mode === 'RESUME_AFTER_APPROVAL' && rawRepOverrideText) {
+            const pipelineId = crmContext.pipelineId ?? 'default';
+            let hubspotToken: string | null = null;
+            try {
+              hubspotToken = await this.tokenManager.getValidAccessToken(tenantId);
+            } catch (err: any) {
+              if (err?.isPermanentOAuthError === true || err?.name === 'HubSpotOAuthRevokedError') {
+                throw err;
+              }
+            }
+            const tenantStages = await this.stageCache.getTenantStages(tenantId, hubspotToken, pipelineId);
+            const parsedOverride = await this.overrideParser.parseRepTextOverride({
+              tenantId,
+              runId: run.id,
+              rawRepText: rawRepOverrideText,
+              existingPayload: finalPayload,
+              tenantStages,
+            });
+
+            if (parsedOverride.action === 'REJECT') {
+              await this.prisma.workflowRun.update({
+                where: { id: run.id },
+                data: { status: RunStatus.COMPLETED, completedAt: new Date() },
+              });
+              return { status: 'rejected_by_rep', runId: run.id };
+            }
+
+            finalPayload = parsedOverride.mergedPayload;
+          }
 
           // STEP 4: Confidence Gate & Human-in-the-Loop Pause
           const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
@@ -345,7 +378,7 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
         }
       : payload;
 
-    return this.whatsappApproval.sendRepApprovalCard({
+    const cardResult = await this.whatsappApproval.sendRepApprovalCard({
       tenantId,
       runId,
       whatsappPhoneNumberId: tenant.whatsappPhoneId || process.env.WHATSAPP_PHONE_NUMBER_ID!,
@@ -354,6 +387,17 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
       crmContext,
       payload: enrichedPayload,
     });
+
+    if (cardResult.whatsappMessageId && cardResult.whatsappMessageId !== 'unknown') {
+      await this.whatsappApproval.registerPendingApprovalSession({
+        tenantId,
+        runId,
+        repPhone: ownerRoute.destinationWhatsappPhone,
+        whatsappMessageId: cardResult.whatsappMessageId,
+      });
+    }
+
+    return cardResult;
   }
 
   private async syncToHubSpotV4(

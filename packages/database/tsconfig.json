@@ -4,6 +4,7 @@
     "noEmit": true,
     "paths": {
       "@nestjs/common": ["../../apps/worker-api/node_modules/@nestjs/common"],
+      "@vexel/database": ["./src/index.ts"],
       "@vexel/crm-hubspot": ["../../packages/crm-hubspot/src/index.ts"],
       "@vexel/extractor": ["../../packages/extractor/src/index.ts"]
     }

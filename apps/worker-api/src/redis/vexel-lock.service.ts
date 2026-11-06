@@ -8,6 +8,7 @@ export interface InboundEventPayload {
   type: 'text' | 'audio';
   text?: string;
   mediaUrl?: string;
+  contextMessageId?: string;
   timestamp: number;
 }
 

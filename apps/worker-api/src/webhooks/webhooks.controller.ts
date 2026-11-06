@@ -24,7 +24,7 @@ import { PrismaService, TenantContext } from '@vexel/database';
 @Controller('v1/webhooks')
 export class WebhooksController {
   private readonly DEBOUNCE_WINDOW_MS = 30_000; // 30-second sliding window
-  private readonly whatsappApproval = new WhatsAppApprovalService();
+  private readonly whatsappApproval: WhatsAppApprovalService;
   private readonly ownerResolver: HubSpotOwnerResolverService;
 
   constructor(
@@ -32,6 +32,7 @@ export class WebhooksController {
     private readonly lockService: VexelLockService,
     @InjectQueue('vexel-workflows') private readonly workflowQueue: Queue,
   ) {
+    this.whatsappApproval = new WhatsAppApprovalService(this.lockService.redis);
     const rawPrisma = this.prisma.client as unknown as PrismaClient;
     const envelopeCrypto = new EnvelopeCryptoService();
     const tokenManager = new HubSpotTokenManagerService(
@@ -73,6 +74,42 @@ export class WebhooksController {
     if (!payload) {
       return { status: 'ignored_non_message_event' };
     }
+
+    // 2. Check if this text message is from a Sales Rep overriding a WAITING_APPROVAL run
+    if (payload.type === 'text' && payload.text) {
+      const pendingApproval = await this.whatsappApproval.resolveRepOverrideTarget(
+        tenantId,
+        payload.senderPhone,
+        payload.contextMessageId,
+      );
+
+      if (pendingApproval) {
+        // Atomically consume the session pointer so double-taps cannot double-patch
+        await this.whatsappApproval.consumeApprovalSession(pendingApproval);
+
+        await this.workflowQueue.add(
+          'execute-revops-pipeline',
+          {
+            tenantId: pendingApproval.tenantId,
+            runId: pendingApproval.runId,
+            mode: 'RESUME_AFTER_APPROVAL',
+            approved: true,
+            rawRepOverrideText: payload.text,
+          },
+          {
+            jobId: `resume-override:${pendingApproval.runId}`,
+            attempts: 5,
+            backoff: { type: 'exponential', delay: 4000 },
+          },
+        );
+
+        return {
+          status: 'rep_text_override_queued',
+          runId: pendingApproval.runId,
+        };
+      }
+    }
+
     if (payload.type === 'text' && payload.text?.trim().toLowerCase().startsWith('/link ')) {
       const emailToBind = payload.text.trim().slice(6).trim();
       const bound = await TenantContext.run(tenantId, () =>
@@ -186,6 +223,7 @@ export class WebhooksController {
       type: entry.type === 'audio' ? 'audio' : 'text',
       text: entry.text?.body,
       mediaUrl: entry.audio?.id,
+      contextMessageId: entry.context?.id,
       timestamp: Number(entry.timestamp) * 1000,
     };
   }
