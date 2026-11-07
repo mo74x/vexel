@@ -7,6 +7,7 @@ declare function beforeAll(fn: () => void | Promise<void>): void;
 declare function afterAll(fn: () => void | Promise<void>): void;
 
 interface JestMatchers<R> {
+  rejects: any;
   not: JestMatchers<R>;
   toBe(expected: unknown): R;
   toEqual(expected: unknown): R;

@@ -244,7 +244,7 @@ export class WebhooksController {
         };
       }
 
-      if (state === 'waiting' || state === 'paused') {
+      if (state === 'waiting' || state === 'prioritized') {
         // Job is queued and has not flushed the Redis buffer yet; it will pick up this message
         return {
           status: 'buffered_into_waiting_job',
