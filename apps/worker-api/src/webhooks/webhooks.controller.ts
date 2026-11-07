@@ -213,7 +213,7 @@ export class WebhooksController {
     return { status: 'workflow_resumed', runId: body.runId };
   }
 
-  private normalizePayload(body: any): InboundEventPayload | null {
+  private normalizePayload(body: any): (InboundEventPayload & { contextMessageId?: string }) | null {
     const entry = body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (!entry) return null;
 
@@ -223,7 +223,7 @@ export class WebhooksController {
       type: entry.type === 'audio' ? 'audio' : 'text',
       text: entry.text?.body,
       mediaUrl: entry.audio?.id,
-      contextMessageId: entry.context?.id,
+      contextMessageId: entry.context?.id, // Populated when rep swipes-to-reply on the card
       timestamp: Number(entry.timestamp) * 1000,
     };
   }

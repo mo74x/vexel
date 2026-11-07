@@ -39,7 +39,7 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
   private readonly whatsappApproval: WhatsAppApprovalService;
   private readonly hubspotV4Sync: HubSpotV4SyncService;
   private readonly ownerResolver: HubSpotOwnerResolverService;
-  private readonly overrideParser: RepOverrideParserService;
+  private readonly repOverrideParser: RepOverrideParserService;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -51,7 +51,7 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
     this.bilingualTranscriber = new BilingualTranscriberService(this.usageMeter);
     this.stageCache = new PipelineStageCacheService(this.lockService.redis);
     this.zodExtractor = new ZodExtractorService(this.usageMeter, this.stageCache);
-    this.overrideParser = new RepOverrideParserService(this.usageMeter);
+    this.repOverrideParser = new RepOverrideParserService(this.usageMeter);
 
     const envelopeCrypto = new EnvelopeCryptoService();
     this.tokenManager = new HubSpotTokenManagerService(
@@ -132,39 +132,6 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
             return this.extractCrmTransitionWithZod(tenantId, run.id, transcriptBundle, crmContext);
           });
 
-          // Apply manual rep edits if resuming from WhatsApp approval card
-          let finalPayload = editedPatch ? { ...extraction, ...editedPatch } : extraction;
-
-          if (mode === 'RESUME_AFTER_APPROVAL' && rawRepOverrideText) {
-            const pipelineId = crmContext.pipelineId ?? 'default';
-            let hubspotToken: string | null = null;
-            try {
-              hubspotToken = await this.tokenManager.getValidAccessToken(tenantId);
-            } catch (err: any) {
-              if (err?.isPermanentOAuthError === true || err?.name === 'HubSpotOAuthRevokedError') {
-                throw err;
-              }
-            }
-            const tenantStages = await this.stageCache.getTenantStages(tenantId, hubspotToken, pipelineId);
-            const parsedOverride = await this.overrideParser.parseRepTextOverride({
-              tenantId,
-              runId: run.id,
-              rawRepText: rawRepOverrideText,
-              existingPayload: finalPayload,
-              tenantStages,
-            });
-
-            if (parsedOverride.action === 'REJECT') {
-              await this.prisma.workflowRun.update({
-                where: { id: run.id },
-                data: { status: RunStatus.COMPLETED, completedAt: new Date() },
-              });
-              return { status: 'rejected_by_rep', runId: run.id };
-            }
-
-            finalPayload = parsedOverride.mergedPayload;
-          }
-
           // STEP 4: Confidence Gate & Human-in-the-Loop Pause
           const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
           const needsApproval =
@@ -177,15 +144,46 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
                 where: { id: run.id },
                 data: {
                   status: RunStatus.WAITING_APPROVAL,
-                  extractedData: finalPayload,
+                  extractedData: extraction,
                   confidenceScore: extraction.confidenceScore,
                 },
               });
-              return this.sendInteractiveApprovalPrompt(tenantId, run.id, crmContext, finalPayload);
+              return this.sendInteractiveApprovalPrompt(tenantId, run.id, crmContext, extraction);
             });
 
             this.logger.log(`Run ${run.id} paused in WAITING_APPROVAL (Confidence: ${extraction.confidenceScore}%)`);
             return { status: 'paused_waiting_for_approval', runId: run.id };
+          }
+
+          // STEP 4B: Apply Rep Text Override if resuming with rawRepOverrideText
+          let finalPayload = editedPatch ? { ...extraction, ...editedPatch } : extraction;
+
+          if (mode === 'RESUME_AFTER_APPROVAL' && job.data.rawRepOverrideText) {
+            const overrideResult = await anvil.run('step-4b-apply-rep-override', async () => {
+              const tenantStages = await this.stageCache.getTenantStages(
+                tenantId,
+                null, // Already cached in Redis or fetched via HubSpotTokenManagerService
+                crmContext.pipelineId ?? 'default',
+              );
+
+              return this.repOverrideParser.parseRepTextOverride({
+                tenantId,
+                runId: run.id,
+                rawRepText: job.data.rawRepOverrideText,
+                existingPayload: extraction,
+                tenantStages,
+              });
+            });
+
+            if (overrideResult.action === 'REJECT') {
+              await this.prisma.workflowRun.update({
+                where: { id: run.id },
+                data: { status: RunStatus.COMPLETED, completedAt: new Date() },
+              });
+              return { status: 'rejected_by_rep_text', runId: run.id };
+            }
+
+            finalPayload = overrideResult.mergedPayload;
           }
 
           // STEP 5: Idempotent HubSpot v4 Batch Sync with Stale-Stage Recovery
@@ -211,11 +209,12 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
               // 1. Purge stale custom stages from Redis so next run fetches live from HubSpot
               await this.stageCache.invalidateTenantStages(tenantId, pipelineId);
 
-              // 2. Evict Step 3, 4, and 5 from Anvil PG step cache (preserving Step 1 Audio & Step 2 CRM lookup)
+              // 2. Evict Step 3, 4, 4b, and 5 from Anvil PG step cache (preserving Step 1 Audio & Step 2 CRM lookup)
               await anvil.invalidateSteps(
                 [
                   'step-3-extract-zod-schema',
                   'step-4-dispatch-approval-prompt',
+                  'step-4b-apply-rep-override',
                   'step-5-sync-hubspot-v4',
                 ],
                 `Stale HubSpot stage ID "${finalPayload.dealStage}" rejected by API`,
@@ -388,14 +387,12 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
       payload: enrichedPayload,
     });
 
-    if (cardResult.whatsappMessageId && cardResult.whatsappMessageId !== 'unknown') {
-      await this.whatsappApproval.registerPendingApprovalSession({
-        tenantId,
-        runId,
-        repPhone: ownerRoute.destinationWhatsappPhone,
-        whatsappMessageId: cardResult.whatsappMessageId,
-      });
-    }
+    await this.whatsappApproval.registerPendingApprovalSession({
+      tenantId,
+      runId,
+      repPhone: ownerRoute.destinationWhatsappPhone,
+      whatsappMessageId: cardResult.whatsappMessageId,
+    });
 
     return cardResult;
   }
