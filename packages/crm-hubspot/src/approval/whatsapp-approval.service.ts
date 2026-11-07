@@ -4,7 +4,7 @@ import { CrmTransitionPayload } from '@vexel/extractor';
 import { ResolvedHubSpotContext } from '../resolver/entity-resolver.service';
 
 export interface ParsedButtonApproval {
-  action: 'approve' | 'reject' | 'undo';
+  action: 'approve' | 'reject' | 'undo' | 'force_undo';
   tenantId: string;
   runId: string;
 }
@@ -19,6 +19,10 @@ export interface HubSpotUndoSnapshot {
   createdNewDeal: boolean;
   previousDealStage: string | null;
   previousAmount: number | null;
+  // Optimistic Concurrency Control (OCC) Watermarks
+  syncedDealLastModifiedMs: number;
+  committedDealStage: string | null;
+  committedAmount: number | null;
   noteId: string | null;
   taskId: string | null;
   receiptWhatsappMessageId?: string;
@@ -59,6 +63,10 @@ export class WhatsAppApprovalService {
     return `vexel:undo:${tenantId}:${runId}`;
   }
 
+  private getForceUndoKey(tenantId: string, runId: string): string {
+    return `vexel:force_undo:${tenantId}:${runId}`;
+  }
+
   private getMsgPointerKey(whatsappMessageId: string): string {
     return `vexel:wa:msg:${whatsappMessageId}`;
   }
@@ -69,7 +77,7 @@ export class WhatsAppApprovalService {
   }
 
   private signButtonPayload(
-    action: 'approve' | 'reject' | 'undo',
+    action: 'approve' | 'reject' | 'undo' | 'force_undo',
     tenantId: string,
     runId: string,
   ): string {
@@ -83,7 +91,7 @@ export class WhatsAppApprovalService {
   }
 
   /**
-   * Verifies HMAC-signed WhatsApp button replies for Approve, Reject, and Undo
+   * Verifies HMAC-signed WhatsApp button replies for Approve, Reject, Undo, and Force Undo
    */
   verifyAndParseButtonReply(buttonId: string): ParsedButtonApproval | null {
     const parts = buttonId.split(':');
@@ -92,11 +100,16 @@ export class WhatsAppApprovalService {
     }
 
     const [, rawAction, tenantId, runId, providedMac] = parts;
-    if (rawAction !== 'approve' && rawAction !== 'reject' && rawAction !== 'undo') {
+    if (
+      rawAction !== 'approve' &&
+      rawAction !== 'reject' &&
+      rawAction !== 'undo' &&
+      rawAction !== 'force_undo'
+    ) {
       return null;
     }
 
-    const expectedFull = this.signButtonPayload(rawAction, tenantId, runId);
+    const expectedFull = this.signButtonPayload(rawAction as any, tenantId, runId);
     const expectedMac = expectedFull.split(':')[4];
 
     const bufA = Buffer.from(providedMac, 'utf8');
@@ -105,7 +118,7 @@ export class WhatsAppApprovalService {
       throw new Error('Invalid HMAC signature on WhatsApp interactive button');
     }
 
-    return { action: rawAction, tenantId, runId };
+    return { action: rawAction as any, tenantId, runId };
   }
 
   /**
@@ -117,6 +130,32 @@ export class WhatsAppApprovalService {
     runId: string,
   ): Promise<HubSpotUndoSnapshot | null> {
     const raw = await this.redis.getdel(this.getUndoKey(tenantId, runId));
+    if (!raw) {
+      return null;
+    }
+    return JSON.parse(raw) as HubSpotUndoSnapshot;
+  }
+
+  /**
+   * Stores the snapshot under a force-undo key in Redis when an OCC conflict is encountered
+   */
+  async armForceUndoSnapshot(snapshot: HubSpotUndoSnapshot): Promise<void> {
+    await this.redis.set(
+      this.getForceUndoKey(snapshot.tenantId, snapshot.runId),
+      JSON.stringify(snapshot),
+      'EX',
+      this.UNDO_WINDOW_SECONDS,
+    );
+  }
+
+  /**
+   * Atomically pops the force-undo snapshot from Redis using GETDEL
+   */
+  async consumeForceUndoSnapshot(
+    tenantId: string,
+    runId: string,
+  ): Promise<HubSpotUndoSnapshot | null> {
+    const raw = await this.redis.getdel(this.getForceUndoKey(tenantId, runId));
     if (!raw) {
       return null;
     }
@@ -454,5 +493,94 @@ export class WhatsAppApprovalService {
         body: JSON.stringify(body),
       },
     );
+  }
+
+  /**
+   * Sends an interactive WhatsApp card on OCC conflict with a 1-click [⚠️ Force Overwrite] button
+   */
+  async sendUndoConflictNotice(params: {
+    tenantId: string;
+    runId: string;
+    whatsappPhoneNumberId: string;
+    whatsappAccessToken: string;
+    repDestinationPhone: string;
+    replyToMessageId?: string;
+    text: string;
+    allowForceOverwrite?: boolean;
+  }): Promise<{ messageId?: string }> {
+    const {
+      tenantId,
+      runId,
+      whatsappPhoneNumberId,
+      whatsappAccessToken,
+      repDestinationPhone,
+      replyToMessageId,
+      text,
+      allowForceOverwrite = true,
+    } = params;
+
+    let body: Record<string, any>;
+
+    if (allowForceOverwrite) {
+      const forceButtonId = this.signButtonPayload('force_undo', tenantId, runId);
+      body = {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: repDestinationPhone.replace(/\D/g, ''),
+        type: 'interactive',
+        interactive: {
+          type: 'button',
+          body: {
+            text: text.slice(0, 1024),
+          },
+          footer: {
+            text: 'Overwrites manual edits in HubSpot',
+          },
+          action: {
+            buttons: [
+              {
+                type: 'reply',
+                reply: {
+                  id: forceButtonId,
+                  title: '⚠️ Force Overwrite', // 17 chars
+                },
+              },
+            ],
+          },
+        },
+      };
+    } else {
+      body = {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: repDestinationPhone.replace(/\D/g, ''),
+        type: 'text',
+        text: { preview_url: false, body: text },
+      };
+    }
+
+    if (replyToMessageId) {
+      body.context = { message_id: replyToMessageId };
+    }
+
+    const response = await fetch(
+      `https://graph.facebook.com/${this.GRAPH_API_VERSION}/${whatsappPhoneNumberId}/messages`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${whatsappAccessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      },
+    );
+
+    if (!response.ok) {
+      const errBody = await response.text();
+      throw new Error(`WhatsApp conflict notice dispatch failed (${response.status}): ${errBody}`);
+    }
+
+    const result = (await response.json()) as { messages?: Array<{ id: string }> };
+    return { messageId: result.messages?.[0]?.id };
   }
 }

@@ -115,33 +115,71 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
           return { status: 'rejected_by_rep', runId: run.id };
         }
 
-        // Handle 15-Minute Undo Rollback Branch inside the Redis Deal Lock
-        if (mode === 'ROLLBACK_AUTO_SYNC' && job.data.undoSnapshot) {
+        // Handle 15-Minute Undo / Force Rollback Branch inside the Redis Deal Lock
+        if ((mode === 'ROLLBACK_AUTO_SYNC' || mode === 'FORCE_ROLLBACK_AUTO_SYNC') && job.data.undoSnapshot) {
           const snapshot: HubSpotUndoSnapshot = job.data.undoSnapshot;
+          const forceOverwrite = mode === 'FORCE_ROLLBACK_AUTO_SYNC';
 
-          const rollbackOutcome = await anvil.run('step-7-rollback-hubspot-sync', async () => {
-            return this.hubspotV4Sync.rollbackSyncIdempotently(tenantId, snapshot);
-          });
+          const rollbackOutcome = await anvil.run(
+            forceOverwrite ? 'step-7-force-rollback-hubspot-sync' : 'step-7-rollback-hubspot-sync',
+            async () => {
+              return this.hubspotV4Sync.rollbackSyncIdempotently(tenantId, snapshot, { forceOverwrite });
+            },
+          );
 
           await this.prisma.workflowRun.update({
             where: { id: run.id },
             data: {
-              errorMessage: `Reverted by rep via 15m Undo button (${rollbackOutcome.dealAction})`,
+              errorMessage: `Undo executed (${forceOverwrite ? 'FORCE' : 'STANDARD'}): ${rollbackOutcome.dealAction} (Conflicts: ${rollbackOutcome.conflictingFields.join(', ') || 'none'})`,
             },
           });
 
           const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
-          const actionSummary =
-            rollbackOutcome.dealAction === 'ARCHIVED_NEW_DEAL'
-              ? `Archived newly created Deal *${snapshot.dealName}*`
-              : `Restored *${snapshot.dealName}* to stage *${snapshot.previousDealStage ?? 'prior'}*`;
+
+          const isConflict =
+            rollbackOutcome.dealAction === 'CONFLICT_PRESERVED_MANUAL_EDIT' ||
+            rollbackOutcome.dealAction === 'PARTIAL_RESTORE_SKIPPED_EDITED_FIELDS';
+
+          if (isConflict && !forceOverwrite) {
+            // Arm Redis with force-undo snapshot so rep can click "Force Overwrite"
+            await this.whatsappApproval.armForceUndoSnapshot(snapshot);
+
+            let conflictText: string;
+            if (rollbackOutcome.dealAction === 'CONFLICT_PRESERVED_MANUAL_EDIT') {
+              conflictText = `🛡️ *Safe Undo (Manual Edit Preserved):* Removed Vexel's timeline note/task, but kept *${snapshot.dealName}* (${rollbackOutcome.conflictingFields.join(', ')}) untouched because it was manually edited in HubSpot (${rollbackOutcome.lastModifiedBySource}). Tap below if you want to force overwrite manual edits.`;
+            } else {
+              conflictText = `↩️ *Partial Undo Completed:* Removed Vexel's note/task and restored unedited fields on *${snapshot.dealName}*, while preserving manual HubSpot edits to *${rollbackOutcome.conflictingFields.join(', ')}*. Tap below to force overwrite all fields.`;
+            }
+
+            await this.whatsappApproval.sendUndoConflictNotice({
+              tenantId,
+              runId: run.id,
+              whatsappPhoneNumberId: tenant.whatsappPhoneId || process.env.WHATSAPP_PHONE_NUMBER_ID!,
+              whatsappAccessToken: process.env.WHATSAPP_SYSTEM_TOKEN!,
+              repDestinationPhone: snapshot.repPhone,
+              replyToMessageId: snapshot.receiptWhatsappMessageId,
+              text: conflictText,
+              allowForceOverwrite: true,
+            });
+
+            return { status: 'rolled_back_with_conflict', runId: run.id, rollbackOutcome };
+          }
+
+          let whatsappNoticeText: string;
+          if (rollbackOutcome.dealAction === 'FORCE_OVERWRITTEN') {
+            whatsappNoticeText = `⚡ *Force Overwrite Applied:* Overwrote all HubSpot manual edits on *${snapshot.dealName}* and restored it to stage *${snapshot.previousDealStage ?? 'prior'}*.`;
+          } else if (rollbackOutcome.dealAction === 'ARCHIVED_NEW_DEAL') {
+            whatsappNoticeText = `↩️ *Vexel Sync Reverted:* Archived newly created Deal *${snapshot.dealName}* and removed the timeline note/task from HubSpot.`;
+          } else {
+            whatsappNoticeText = `↩️ *Vexel Sync Reverted:* Restored *${snapshot.dealName}* to stage *${snapshot.previousDealStage ?? 'prior'}* and removed the timeline note/task from HubSpot.`;
+          }
 
           await this.whatsappApproval.sendUndoStatusNotice({
             whatsappPhoneNumberId: tenant.whatsappPhoneId || process.env.WHATSAPP_PHONE_NUMBER_ID!,
             whatsappAccessToken: process.env.WHATSAPP_SYSTEM_TOKEN!,
             repDestinationPhone: snapshot.repPhone,
             replyToMessageId: snapshot.receiptWhatsappMessageId,
-            text: `↩️ *Vexel Sync Reverted:* ${actionSummary} and removed the timeline note/task from HubSpot.`,
+            text: whatsappNoticeText,
           });
 
           return { status: 'rolled_back_successfully', runId: run.id, rollbackOutcome };
@@ -556,6 +594,9 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
               createdNewDeal: syncResult.createdNewDeal,
               previousDealStage: crmContext.currentDealStage,
               previousAmount: crmContext.currentAmount,
+              syncedDealLastModifiedMs: syncResult.syncedDealLastModifiedMs,
+              committedDealStage: syncResult.committedDealStage,
+              committedAmount: syncResult.committedAmount,
               noteId: syncResult.noteId,
               taskId: syncResult.taskId,
             }

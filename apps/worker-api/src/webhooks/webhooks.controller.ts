@@ -70,6 +70,15 @@ export class WebhooksController {
           );
         }
 
+        if (verified.action === 'force_undo') {
+          return this.handleRepForceUndoRequest(
+            verified.tenantId,
+            verified.runId,
+            rawMsg.from,
+            rawMsg.context?.id,
+          );
+        }
+
         return this.handleRepApproval({
           tenantId: verified.tenantId,
           runId: verified.runId,
@@ -259,6 +268,44 @@ export class WebhooksController {
     );
 
     return { status: 'undo_rollback_queued', runId };
+  }
+
+  private async handleRepForceUndoRequest(
+    tenantId: string,
+    runId: string,
+    repSenderPhone: string,
+    quotedReceiptWamid?: string,
+  ) {
+    // Atomically pop the force-undo snapshot from Redis using GETDEL
+    const snapshot = await this.whatsappApproval.consumeForceUndoSnapshot(tenantId, runId);
+
+    if (!snapshot) {
+      await this.whatsappApproval.sendUndoStatusNotice({
+        whatsappPhoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID!,
+        whatsappAccessToken: process.env.WHATSAPP_SYSTEM_TOKEN!,
+        repDestinationPhone: repSenderPhone,
+        replyToMessageId: quotedReceiptWamid,
+        text: `⏳ *Force Overwrite Expired:* The rollback snapshot for Run #${runId.slice(-6)} has expired or was already applied.`,
+      });
+      return { status: 'force_undo_window_expired', runId };
+    }
+
+    await this.workflowQueue.add(
+      'execute-revops-pipeline',
+      {
+        tenantId,
+        runId,
+        mode: 'FORCE_ROLLBACK_AUTO_SYNC',
+        undoSnapshot: snapshot,
+      },
+      {
+        jobId: `force-undo:${runId}`,
+        attempts: 5,
+        backoff: { type: 'exponential', delay: 3000 },
+      },
+    );
+
+    return { status: 'force_undo_rollback_queued', runId };
   }
 
   private normalizePayload(body: any): (InboundEventPayload & { contextMessageId?: string }) | null {

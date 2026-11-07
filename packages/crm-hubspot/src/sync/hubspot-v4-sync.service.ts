@@ -17,7 +17,15 @@ const HS_ASSOC_TYPE = {
   TASK_TO_DEAL: 216,
 } as const;
 export interface HubSpotRollbackOutcome {
-  dealAction: 'RESTORED_PREVIOUS_STATE' | 'ARCHIVED_NEW_DEAL' | 'NO_DEAL_CHANGE';
+  dealAction:
+    | 'RESTORED_PREVIOUS_STATE'
+    | 'ARCHIVED_NEW_DEAL'
+    | 'PARTIAL_RESTORE_SKIPPED_EDITED_FIELDS'
+    | 'CONFLICT_PRESERVED_MANUAL_EDIT'
+    | 'FORCE_OVERWRITTEN'
+    | 'NO_DEAL_CHANGE';
+  conflictingFields: string[];
+  lastModifiedBySource?: string;
   noteDeleted: boolean;
   taskDeleted: boolean;
 }
@@ -28,9 +36,36 @@ export interface HubSpotSyncOutcome {
   noteId: string | null;
   taskId: string | null;
   createdNewDeal: boolean;
+  syncedDealLastModifiedMs: number;
+  committedDealStage: string | null;
+  committedAmount: number | null;
+}
+
+interface HubSpotPropertyHistoryEntry {
+  value: string;
+  timestamp: string; // ISO-8601 timestamp of when this specific property changed
+  sourceType: string; // e.g., "INTEGRATION", "CRM_UI", "WORKFLOWS", "AUTOMATION_PLATFORM"
+  sourceId?: string;
+}
+
+interface HubSpotDealWithHistoryResponse {
+  id: string;
+  updatedAt: string;
+  properties: {
+    dealstage?: string;
+    amount?: string;
+    hs_lastmodifieddate?: string;
+  };
+  propertiesWithHistory?: {
+    dealstage?: HubSpotPropertyHistoryEntry[];
+    amount?: HubSpotPropertyHistoryEntry[];
+  };
 }
 
 export class HubSpotV4SyncService {
+  // Allow 3,000ms grace window for HubSpot's async association indexers to settle
+  private readonly ASSOC_SETTLE_GRACE_MS = 3_000;
+
   constructor(private readonly http: HubSpotHttpClient) { }
 
   async syncTransitionIdempotently(params: {
@@ -84,7 +119,44 @@ export class HubSpotV4SyncService {
       });
     }
 
-    return { dealId, contactId, noteId, taskId, createdNewDeal };
+    // 6. Read authoritative post-sync Deal state AFTER Note/Task associations settle
+    const watermark = await this.readDealWatermark(tenantId, dealId);
+
+    return {
+      dealId,
+      contactId,
+      noteId,
+      taskId,
+      createdNewDeal,
+      syncedDealLastModifiedMs: watermark.lastModifiedMs,
+      committedDealStage: watermark.dealstage,
+      committedAmount: watermark.amount,
+    };
+  }
+
+  private async readDealWatermark(
+    tenantId: string,
+    dealId: string,
+  ): Promise<{
+    lastModifiedMs: number;
+    dealstage: string | null;
+    amount: number | null;
+  }> {
+    const res = await this.http.request<HubSpotDealWithHistoryResponse>({
+      tenantId,
+      path: `/crm/v3/objects/deals/${dealId}?properties=dealstage,amount,hs_lastmodifieddate`,
+      method: 'GET',
+    });
+
+    const props = res.data?.properties ?? {};
+    const modifiedIso = props.hs_lastmodifieddate ?? res.data?.updatedAt;
+    const lastModifiedMs = modifiedIso ? new Date(modifiedIso).getTime() : Date.now();
+
+    return {
+      lastModifiedMs,
+      dealstage: props.dealstage ?? null,
+      amount: props.amount !== undefined && props.amount !== null ? Number(props.amount) : null,
+    };
   }
 
   private async ensureContactForPhone(tenantId: string, senderPhone: string): Promise<string> {
@@ -406,18 +478,20 @@ export class HubSpotV4SyncService {
   }
   
   /**
-   * Compensating Saga Transaction: Reverts the HubSpot Deal stage/amount
-   * (or archives a net-new Deal) and deletes the created Timeline Note and Task.
+   * Optimistic Concurrency-Safe Compensating Saga:
+   * 1. Always deletes Vexel's Timeline Note & Task.
+   * 2. Inspects hs_lastmodifieddate and propertiesWithHistory before touching the Deal.
    */
   async rollbackSyncIdempotently(
     tenantId: string,
     snapshot: HubSpotUndoSnapshot,
+    options?: { forceOverwrite?: boolean },
   ): Promise<HubSpotRollbackOutcome> {
+    const forceOverwrite = Boolean(options?.forceOverwrite);
     let noteDeleted = false;
     let taskDeleted = false;
-    let dealAction: HubSpotRollbackOutcome['dealAction'] = 'NO_DEAL_CHANGE';
 
-    // 1. Delete the created Timeline Note (404-tolerant for idempotent retries)
+    // 1. Always delete Vexel's own Timeline Note (safe regardless of Deal UI edits)
     if (snapshot.noteId) {
       const noteRes = await this.http.request({
         tenantId,
@@ -430,7 +504,7 @@ export class HubSpotV4SyncService {
       noteDeleted = true;
     }
 
-    // 2. Delete the created Follow-Up Task (404-tolerant for idempotent retries)
+    // 2. Always delete Vexel's own Follow-Up Task
     if (snapshot.taskId) {
       const taskRes = await this.http.request({
         tenantId,
@@ -443,8 +517,72 @@ export class HubSpotV4SyncService {
       taskDeleted = true;
     }
 
-    // 3. Compensate Deal Mutation: Archive if newly created, or restore previous stage & amount
+    // 3. Fetch live Deal state + property mutation history from HubSpot
+    const liveDealRes = await this.http.request<HubSpotDealWithHistoryResponse>({
+      tenantId,
+      path: `/crm/v3/objects/deals/${snapshot.dealId}?properties=dealstage,amount,hs_lastmodifieddate&propertiesWithHistory=dealstage,amount`,
+      method: 'GET',
+    });
+
+    if (liveDealRes.status === 404) {
+      return {
+        dealAction: 'NO_DEAL_CHANGE',
+        conflictingFields: [],
+        noteDeleted,
+        taskDeleted,
+      };
+    }
+
+    if (liveDealRes.status >= 400) {
+      throw new Error(`Failed to inspect Deal ${snapshot.dealId} before Undo (${liveDealRes.status})`);
+    }
+
+    const liveProps = liveDealRes.data.properties ?? {};
+    const liveHistory = liveDealRes.data.propertiesWithHistory ?? {};
+    const liveModifiedMs = new Date(
+      liveProps.hs_lastmodifieddate ?? liveDealRes.data.updatedAt ?? 0,
+    ).getTime();
+
+    const timestampDrifted =
+      liveModifiedMs > snapshot.syncedDealLastModifiedMs + this.ASSOC_SETTLE_GRACE_MS;
+
+    // Check field-level conflicts via value equality AND propertiesWithHistory sourceType
+    const stageConflict = this.hasFieldBeenManuallyEdited({
+      currentValue: liveProps.dealstage ?? null,
+      committedValue: snapshot.committedDealStage,
+      historyEntries: liveHistory.dealstage,
+      watermarkMs: snapshot.syncedDealLastModifiedMs,
+    });
+
+    const liveAmountNum =
+      liveProps.amount !== undefined && liveProps.amount !== null && liveProps.amount !== ''
+        ? Number(liveProps.amount)
+        : null;
+
+    const amountConflict = this.hasFieldBeenManuallyEdited({
+      currentValue: liveAmountNum !== null ? String(liveAmountNum) : null,
+      committedValue: snapshot.committedAmount !== null ? String(snapshot.committedAmount) : null,
+      historyEntries: liveHistory.amount,
+      watermarkMs: snapshot.syncedDealLastModifiedMs,
+    });
+
+    const conflictingFields: string[] = [];
+    if (stageConflict.isConflicted) conflictingFields.push('dealstage');
+    if (amountConflict.isConflicted) conflictingFields.push('amount');
+
+    // 4. Branch A: Net-New Deal Created by Vexel
     if (snapshot.createdNewDeal) {
+      if (!forceOverwrite && (timestampDrifted || conflictingFields.length > 0)) {
+        // A human edited the new Deal in HubSpot UI after creation -> NEVER delete their work unless forceOverwrite
+        return {
+          dealAction: 'CONFLICT_PRESERVED_MANUAL_EDIT',
+          conflictingFields: conflictingFields.length > 0 ? conflictingFields : ['hs_lastmodifieddate'],
+          lastModifiedBySource: stageConflict.sourceType ?? amountConflict.sourceType ?? 'CRM_UI',
+          noteDeleted,
+          taskDeleted,
+        };
+      }
+
       const delDealRes = await this.http.request({
         tenantId,
         path: `/crm/v3/objects/deals/${snapshot.dealId}`,
@@ -453,32 +591,113 @@ export class HubSpotV4SyncService {
       if (delDealRes.status >= 400 && delDealRes.status !== 404) {
         throw new Error(`Failed to archive new HubSpot Deal ${snapshot.dealId} (${delDealRes.status})`);
       }
-      dealAction = 'ARCHIVED_NEW_DEAL';
-    } else {
-      const restoreProps: Record<string, string | number> = {};
-      if (snapshot.previousDealStage) {
-        restoreProps.dealstage = snapshot.previousDealStage;
-      }
-      if (snapshot.previousAmount !== null && snapshot.previousAmount !== undefined) {
-        restoreProps.amount = snapshot.previousAmount;
+
+      return {
+        dealAction: forceOverwrite && conflictingFields.length > 0 ? 'FORCE_OVERWRITTEN' : 'ARCHIVED_NEW_DEAL',
+        conflictingFields,
+        noteDeleted,
+        taskDeleted,
+      };
+    }
+
+    // 5. Branch B: Existing Deal Updated by Vexel -> Only revert unedited fields (unless forceOverwrite)
+    const restoreProps: Record<string, string | number> = {};
+
+    if (snapshot.previousDealStage && (!stageConflict.isConflicted || forceOverwrite)) {
+      restoreProps.dealstage = snapshot.previousDealStage;
+    }
+    if (
+      snapshot.previousAmount !== null &&
+      snapshot.previousAmount !== undefined &&
+      (!amountConflict.isConflicted || forceOverwrite)
+    ) {
+      restoreProps.amount = snapshot.previousAmount;
+    }
+
+    // If every field Vexel touched was subsequently overwritten in the HubSpot UI, skip PATCH unless forceOverwrite
+    if (!forceOverwrite && Object.keys(restoreProps).length === 0 && conflictingFields.length > 0) {
+      return {
+        dealAction: 'CONFLICT_PRESERVED_MANUAL_EDIT',
+        conflictingFields,
+        lastModifiedBySource: stageConflict.sourceType ?? amountConflict.sourceType ?? 'CRM_UI',
+        noteDeleted,
+        taskDeleted,
+      };
+    }
+
+    if (Object.keys(restoreProps).length > 0) {
+      const patchRes = await this.http.request({
+        tenantId,
+        path: `/crm/v3/objects/deals/${snapshot.dealId}`,
+        method: 'PATCH',
+        body: { properties: restoreProps },
+      });
+
+      if (patchRes.status >= 400) {
+        throw new Error(
+          `Failed to restore HubSpot Deal ${snapshot.dealId} (${patchRes.status}): ${JSON.stringify(patchRes.data)}`,
+        );
       }
 
-      if (Object.keys(restoreProps).length > 0) {
-        const patchRes = await this.http.request({
-          tenantId,
-          path: `/crm/v3/objects/deals/${snapshot.dealId}`,
-          method: 'PATCH',
-          body: { properties: restoreProps },
-        });
-        if (patchRes.status >= 400) {
-          throw new Error(
-            `Failed to restore HubSpot Deal ${snapshot.dealId} (${patchRes.status}): ${JSON.stringify(patchRes.data)}`,
-          );
-        }
-        dealAction = 'RESTORED_PREVIOUS_STATE';
+      return {
+        dealAction: forceOverwrite
+          ? 'FORCE_OVERWRITTEN'
+          : conflictingFields.length > 0
+            ? 'PARTIAL_RESTORE_SKIPPED_EDITED_FIELDS'
+            : 'RESTORED_PREVIOUS_STATE',
+        conflictingFields,
+        lastModifiedBySource: stageConflict.sourceType ?? amountConflict.sourceType,
+        noteDeleted,
+        taskDeleted,
+      };
+    }
+
+    return {
+      dealAction: 'NO_DEAL_CHANGE',
+      conflictingFields: [],
+      noteDeleted,
+      taskDeleted,
+    };
+  }
+
+  /**
+   * Checks if a property was modified after Vexel's sync watermark or changed in the HubSpot UI
+   */
+  private hasFieldBeenManuallyEdited(params: {
+    currentValue: string | null;
+    committedValue: string | null;
+    historyEntries?: HubSpotPropertyHistoryEntry[];
+    watermarkMs: number;
+  }): { isConflicted: boolean; sourceType?: string } {
+    const { currentValue, committedValue, historyEntries, watermarkMs } = params;
+
+    // 1. Direct Compare-And-Swap (CAS) value check
+    if (
+      committedValue !== null &&
+      currentValue !== null &&
+      String(currentValue) !== String(committedValue)
+    ) {
+      const latestEntry = historyEntries?.[0];
+      return {
+        isConflicted: true,
+        sourceType: latestEntry?.sourceType ?? 'CRM_UI',
+      };
+    }
+
+    // 2. History log check: even if value matches, did a human in CRM_UI explicitly re-save it after our commit?
+    const latestEntry = historyEntries?.[0];
+    if (latestEntry) {
+      const entryTimeMs = new Date(latestEntry.timestamp).getTime();
+      const editedAfterSync = entryTimeMs > watermarkMs + this.ASSOC_SETTLE_GRACE_MS;
+
+      if (editedAfterSync && latestEntry.sourceType !== 'INTEGRATION') {
+        return {
+          isConflicted: true,
+          sourceType: latestEntry.sourceType,
+        };
       }
     }
 
-    return { dealAction, noteDeleted, taskDeleted };
+    return { isConflicted: false };
   }
 }
