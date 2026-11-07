@@ -61,6 +61,15 @@ export class WebhooksController {
     if (buttonReplyId && buttonReplyId.startsWith('vexel_act:')) {
       const verified = this.whatsappApproval.verifyAndParseButtonReply(buttonReplyId);
       if (verified) {
+        if (verified.action === 'undo') {
+          return this.handleRepUndoRequest(
+            verified.tenantId,
+            verified.runId,
+            rawMsg.from,
+            rawMsg.context?.id,
+          );
+        }
+
         return this.handleRepApproval({
           tenantId: verified.tenantId,
           runId: verified.runId,
@@ -211,6 +220,45 @@ export class WebhooksController {
     );
 
     return { status: 'workflow_resumed', runId: body.runId };
+  }
+
+  private async handleRepUndoRequest(
+    tenantId: string,
+    runId: string,
+    repSenderPhone: string,
+    quotedReceiptWamid?: string,
+  ) {
+    // Atomically pop the 15-minute snapshot from Redis
+    const snapshot = await this.whatsappApproval.consumeUndoSnapshot(tenantId, runId);
+
+    if (!snapshot) {
+      // Window expired (>15 mins) or already undone -> send immediate notice
+      await this.whatsappApproval.sendUndoStatusNotice({
+        whatsappPhoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID!,
+        whatsappAccessToken: process.env.WHATSAPP_SYSTEM_TOKEN!,
+        repDestinationPhone: repSenderPhone,
+        replyToMessageId: quotedReceiptWamid,
+        text: `⏳ *Undo Window Expired:* The 15-minute rollback window for Run #${runId.slice(-6)} has closed, or this update was already reverted.`,
+      });
+      return { status: 'undo_window_expired', runId };
+    }
+
+    await this.workflowQueue.add(
+      'execute-revops-pipeline',
+      {
+        tenantId,
+        runId,
+        mode: 'ROLLBACK_AUTO_SYNC',
+        undoSnapshot: snapshot,
+      },
+      {
+        jobId: `undo:${runId}`,
+        attempts: 5,
+        backoff: { type: 'exponential', delay: 3000 },
+      },
+    );
+
+    return { status: 'undo_rollback_queued', runId };
   }
 
   private normalizePayload(body: any): (InboundEventPayload & { contextMessageId?: string }) | null {

@@ -5,6 +5,7 @@ import {
   isHubSpotStaleStageError,
 } from '../errors/stale-stage.error';
 import { CrmTransitionPayload } from '@vexel/extractor';
+import { HubSpotUndoSnapshot } from '../approval/whatsapp-approval.service';
 
 // Official HubSpot v4 HUBSPOT_DEFINED Association Type IDs
 const HS_ASSOC_TYPE = {
@@ -15,6 +16,11 @@ const HS_ASSOC_TYPE = {
   TASK_TO_COMPANY: 192,
   TASK_TO_DEAL: 216,
 } as const;
+export interface HubSpotRollbackOutcome {
+  dealAction: 'RESTORED_PREVIOUS_STATE' | 'ARCHIVED_NEW_DEAL' | 'NO_DEAL_CHANGE';
+  noteDeleted: boolean;
+  taskDeleted: boolean;
+}
 
 export interface HubSpotSyncOutcome {
   dealId: string;
@@ -25,7 +31,7 @@ export interface HubSpotSyncOutcome {
 }
 
 export class HubSpotV4SyncService {
-  constructor(private readonly http: HubSpotHttpClient) {}
+  constructor(private readonly http: HubSpotHttpClient) { }
 
   async syncTransitionIdempotently(params: {
     tenantId: string;
@@ -397,5 +403,82 @@ export class HubSpotV4SyncService {
     }
 
     return String(createTaskRes.data.id);
+  }
+  
+  /**
+   * Compensating Saga Transaction: Reverts the HubSpot Deal stage/amount
+   * (or archives a net-new Deal) and deletes the created Timeline Note and Task.
+   */
+  async rollbackSyncIdempotently(
+    tenantId: string,
+    snapshot: HubSpotUndoSnapshot,
+  ): Promise<HubSpotRollbackOutcome> {
+    let noteDeleted = false;
+    let taskDeleted = false;
+    let dealAction: HubSpotRollbackOutcome['dealAction'] = 'NO_DEAL_CHANGE';
+
+    // 1. Delete the created Timeline Note (404-tolerant for idempotent retries)
+    if (snapshot.noteId) {
+      const noteRes = await this.http.request({
+        tenantId,
+        path: `/crm/v3/objects/notes/${snapshot.noteId}`,
+        method: 'DELETE',
+      });
+      if (noteRes.status >= 400 && noteRes.status !== 404) {
+        throw new Error(`Failed to delete HubSpot Note ${snapshot.noteId} (${noteRes.status})`);
+      }
+      noteDeleted = true;
+    }
+
+    // 2. Delete the created Follow-Up Task (404-tolerant for idempotent retries)
+    if (snapshot.taskId) {
+      const taskRes = await this.http.request({
+        tenantId,
+        path: `/crm/v3/objects/tasks/${snapshot.taskId}`,
+        method: 'DELETE',
+      });
+      if (taskRes.status >= 400 && taskRes.status !== 404) {
+        throw new Error(`Failed to delete HubSpot Task ${snapshot.taskId} (${taskRes.status})`);
+      }
+      taskDeleted = true;
+    }
+
+    // 3. Compensate Deal Mutation: Archive if newly created, or restore previous stage & amount
+    if (snapshot.createdNewDeal) {
+      const delDealRes = await this.http.request({
+        tenantId,
+        path: `/crm/v3/objects/deals/${snapshot.dealId}`,
+        method: 'DELETE',
+      });
+      if (delDealRes.status >= 400 && delDealRes.status !== 404) {
+        throw new Error(`Failed to archive new HubSpot Deal ${snapshot.dealId} (${delDealRes.status})`);
+      }
+      dealAction = 'ARCHIVED_NEW_DEAL';
+    } else {
+      const restoreProps: Record<string, string | number> = {};
+      if (snapshot.previousDealStage) {
+        restoreProps.dealstage = snapshot.previousDealStage;
+      }
+      if (snapshot.previousAmount !== null && snapshot.previousAmount !== undefined) {
+        restoreProps.amount = snapshot.previousAmount;
+      }
+
+      if (Object.keys(restoreProps).length > 0) {
+        const patchRes = await this.http.request({
+          tenantId,
+          path: `/crm/v3/objects/deals/${snapshot.dealId}`,
+          method: 'PATCH',
+          body: { properties: restoreProps },
+        });
+        if (patchRes.status >= 400) {
+          throw new Error(
+            `Failed to restore HubSpot Deal ${snapshot.dealId} (${patchRes.status}): ${JSON.stringify(patchRes.data)}`,
+          );
+        }
+        dealAction = 'RESTORED_PREVIOUS_STATE';
+      }
+    }
+
+    return { dealAction, noteDeleted, taskDeleted };
   }
 }

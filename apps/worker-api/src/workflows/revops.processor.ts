@@ -13,6 +13,7 @@ import {
   HubSpotOwnerResolverService,
   HubSpotSyncOutcome,
   HubSpotTokenManagerService,
+  HubSpotUndoSnapshot,
   HubSpotV4SyncService,
   ResolvedHubSpotContext,
   WhatsAppApprovalService,
@@ -112,6 +113,38 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
             data: { status: RunStatus.COMPLETED, completedAt: new Date() },
           });
           return { status: 'rejected_by_rep', runId: run.id };
+        }
+
+        // Handle 15-Minute Undo Rollback Branch inside the Redis Deal Lock
+        if (mode === 'ROLLBACK_AUTO_SYNC' && job.data.undoSnapshot) {
+          const snapshot: HubSpotUndoSnapshot = job.data.undoSnapshot;
+
+          const rollbackOutcome = await anvil.run('step-7-rollback-hubspot-sync', async () => {
+            return this.hubspotV4Sync.rollbackSyncIdempotently(tenantId, snapshot);
+          });
+
+          await this.prisma.workflowRun.update({
+            where: { id: run.id },
+            data: {
+              errorMessage: `Reverted by rep via 15m Undo button (${rollbackOutcome.dealAction})`,
+            },
+          });
+
+          const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
+          const actionSummary =
+            rollbackOutcome.dealAction === 'ARCHIVED_NEW_DEAL'
+              ? `Archived newly created Deal *${snapshot.dealName}*`
+              : `Restored *${snapshot.dealName}* to stage *${snapshot.previousDealStage ?? 'prior'}*`;
+
+          await this.whatsappApproval.sendUndoStatusNotice({
+            whatsappPhoneNumberId: tenant.whatsappPhoneId || process.env.WHATSAPP_PHONE_NUMBER_ID!,
+            whatsappAccessToken: process.env.WHATSAPP_SYSTEM_TOKEN!,
+            repDestinationPhone: snapshot.repPhone,
+            replyToMessageId: snapshot.receiptWhatsappMessageId,
+            text: `↩️ *Vexel Sync Reverted:* ${actionSummary} and removed the timeline note/task from HubSpot.`,
+          });
+
+          return { status: 'rolled_back_successfully', runId: run.id, rollbackOutcome };
         }
 
         try {
@@ -234,7 +267,7 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
                 hasRepOverride: Boolean(job.data.rawRepOverrideText || editedPatch),
                 crmContext,
                 finalPayload,
-                dealId: syncResult.dealId,
+                syncResult,
               });
             });
           } catch (receiptErr: any) {
@@ -439,7 +472,7 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
     hasRepOverride: boolean;
     crmContext: ResolvedHubSpotContext;
     finalPayload: CrmTransitionPayload;
-    dealId: string;
+    syncResult: HubSpotSyncOutcome;
   }) {
     const {
       tenantId,
@@ -448,7 +481,7 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
       hasRepOverride,
       crmContext,
       finalPayload,
-      dealId,
+      syncResult,
     } = params;
 
     const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
@@ -491,22 +524,42 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
           : 'REP_APPROVED'
         : 'AUTO_SYNC';
 
+    const dealName =
+      crmContext.currentDealName ??
+      finalPayload.dealName ??
+      crmContext.contactName ??
+      `Deal #${syncResult.dealId}`;
+
     return this.whatsappApproval.sendSyncConfirmationReceipt({
+      tenantId,
+      runId,
       whatsappPhoneNumberId: tenant.whatsappPhoneId || process.env.WHATSAPP_PHONE_NUMBER_ID!,
       whatsappAccessToken: process.env.WHATSAPP_SYSTEM_TOKEN!,
       repDestinationPhone: ownerRoute.destinationWhatsappPhone,
       hubspotPortalId: tenant.hubspotPortalId,
-      dealId,
-      dealName:
-        crmContext.currentDealName ??
-        finalPayload.dealName ??
-        crmContext.contactName ??
-        `Deal #${dealId}`,
+      dealId: syncResult.dealId,
+      dealName,
       stageLabel,
       amount: finalPayload.amount ?? crmContext.currentAmount,
       currency: finalPayload.currency ?? 'USD',
       syncMode,
       replyToWhatsappMessageId: approvalCardWamid,
+      undoSnapshot:
+        syncMode === 'AUTO_SYNC'
+          ? {
+              tenantId,
+              runId,
+              repPhone: ownerRoute.destinationWhatsappPhone,
+              hubspotPortalId: tenant.hubspotPortalId,
+              dealId: syncResult.dealId,
+              dealName,
+              createdNewDeal: syncResult.createdNewDeal,
+              previousDealStage: crmContext.currentDealStage,
+              previousAmount: crmContext.currentAmount,
+              noteId: syncResult.noteId,
+              taskId: syncResult.taskId,
+            }
+          : undefined,
     });
   }
 }

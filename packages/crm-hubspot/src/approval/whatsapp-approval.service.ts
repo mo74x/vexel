@@ -4,11 +4,29 @@ import { CrmTransitionPayload } from '@vexel/extractor';
 import { ResolvedHubSpotContext } from '../resolver/entity-resolver.service';
 
 export interface ParsedButtonApproval {
-  action: 'approve' | 'reject';
+  action: 'approve' | 'reject' | 'undo';
   tenantId: string;
   runId: string;
 }
+
+export interface HubSpotUndoSnapshot {
+  tenantId: string;
+  runId: string;
+  repPhone: string;
+  hubspotPortalId: string | null;
+  dealId: string;
+  dealName: string;
+  createdNewDeal: boolean;
+  previousDealStage: string | null;
+  previousAmount: number | null;
+  noteId: string | null;
+  taskId: string | null;
+  receiptWhatsappMessageId?: string;
+}
+
 export interface SyncReceiptParams {
+  tenantId: string;
+  runId: string;
   whatsappPhoneNumberId: string;
   whatsappAccessToken: string;
   repDestinationPhone: string;
@@ -20,6 +38,7 @@ export interface SyncReceiptParams {
   currency: string | null;
   syncMode: 'AUTO_SYNC' | 'REP_APPROVED' | 'REP_OVERRIDDEN';
   replyToWhatsappMessageId?: string; // Threads receipt under the approval card if present
+  undoSnapshot?: Omit<HubSpotUndoSnapshot, 'receiptWhatsappMessageId'>;
 }
 
 export interface PendingApprovalPointer {
@@ -32,8 +51,13 @@ export interface PendingApprovalPointer {
 export class WhatsAppApprovalService {
   private readonly GRAPH_API_VERSION = 'v21.0';
   private readonly SESSION_TTL_SECONDS = 24 * 3600; // 24-hour approval window
+  private readonly UNDO_WINDOW_SECONDS = 15 * 60; // Strict 15-minute (900s) TTL
 
   constructor(private readonly redis: Redis) { }
+
+  private getUndoKey(tenantId: string, runId: string): string {
+    return `vexel:undo:${tenantId}:${runId}`;
+  }
 
   private getMsgPointerKey(whatsappMessageId: string): string {
     return `vexel:wa:msg:${whatsappMessageId}`;
@@ -44,7 +68,11 @@ export class WhatsAppApprovalService {
     return `vexel:wa:rep:${tenantId}:${digits}`;
   }
 
-  private signButtonPayload(action: 'approve' | 'reject', tenantId: string, runId: string): string {
+  private signButtonPayload(
+    action: 'approve' | 'reject' | 'undo',
+    tenantId: string,
+    runId: string,
+  ): string {
     const secret = process.env.VEXEL_APPROVAL_HMAC_SECRET || 'dev_approval_secret';
     const mac = createHmac('sha256', secret)
       .update(`${action}:${tenantId}:${runId}`)
@@ -55,7 +83,7 @@ export class WhatsAppApprovalService {
   }
 
   /**
-   * Verifies the HMAC-signed button reply when a rep taps [Approve & Sync] or [Discard] on WhatsApp
+   * Verifies HMAC-signed WhatsApp button replies for Approve, Reject, and Undo
    */
   verifyAndParseButtonReply(buttonId: string): ParsedButtonApproval | null {
     const parts = buttonId.split(':');
@@ -64,10 +92,9 @@ export class WhatsAppApprovalService {
     }
 
     const [, rawAction, tenantId, runId, providedMac] = parts;
-    if (rawAction !== 'approve' && rawAction !== 'reject') {
+    if (rawAction !== 'approve' && rawAction !== 'reject' && rawAction !== 'undo') {
       return null;
     }
-
 
     const expectedFull = this.signButtonPayload(rawAction, tenantId, runId);
     const expectedMac = expectedFull.split(':')[4];
@@ -75,10 +102,25 @@ export class WhatsAppApprovalService {
     const bufA = Buffer.from(providedMac, 'utf8');
     const bufB = Buffer.from(expectedMac, 'utf8');
     if (bufA.length !== bufB.length || !timingSafeEqual(bufA, bufB)) {
-      throw new Error('Invalid HMAC signature on WhatsApp interactive approval button');
+      throw new Error('Invalid HMAC signature on WhatsApp interactive button');
     }
 
     return { action: rawAction, tenantId, runId };
+  }
+
+  /**
+   * Atomically pops the 15-minute undo snapshot from Redis using GETDEL.
+   * Returns null if the 15-minute window expired or if already clicked.
+   */
+  async consumeUndoSnapshot(
+    tenantId: string,
+    runId: string,
+  ): Promise<HubSpotUndoSnapshot | null> {
+    const raw = await this.redis.getdel(this.getUndoKey(tenantId, runId));
+    if (!raw) {
+      return null;
+    }
+    return JSON.parse(raw) as HubSpotUndoSnapshot;
   }
   /**
    * Call immediately after sendRepApprovalCard() receives the wamid from Meta Graph API
@@ -258,12 +300,16 @@ export class WhatsAppApprovalService {
   }
 
   /**
-   * Sends a 1-line confirmation receipt with a direct HubSpot Deal link back to the sales rep
+   * Sends a 1-line confirmation receipt.
+   * If syncMode === 'AUTO_SYNC', attaches an interactive 15-minute [↩️ Undo Sync] button
+   * and arms the 900-second Redis rollback snapshot.
    */
   async sendSyncConfirmationReceipt(
     params: SyncReceiptParams,
   ): Promise<{ receiptMessageId: string }> {
     const {
+      tenantId,
+      runId,
       whatsappPhoneNumberId,
       whatsappAccessToken,
       repDestinationPhone,
@@ -275,13 +321,12 @@ export class WhatsAppApprovalService {
       currency,
       syncMode,
       replyToWhatsappMessageId,
+      undoSnapshot,
     } = params;
 
     const dealUrl = this.buildHubSpotDealUrl(hubspotPortalId, dealId);
     const formattedAmount =
-      amount !== null
-        ? ` • ${amount.toLocaleString()} ${currency ?? 'USD'}`
-        : '';
+      amount !== null ? ` • ${amount.toLocaleString()} ${currency ?? 'USD'}` : '';
 
     const modeBadge =
       syncMode === 'REP_OVERRIDDEN'
@@ -290,21 +335,51 @@ export class WhatsAppApprovalService {
           ? '✅ *Vexel Approved & Synced*'
           : '⚡ *Vexel Auto-Synced*';
 
-    // Strict 1-line receipt format with direct HubSpot deep link
     const receiptLine = `${modeBadge}: *${dealName}* → *${stageLabel}*${formattedAmount} — ${dealUrl}`;
 
-    const requestBody: Record<string, any> = {
-      messaging_product: 'whatsapp',
-      recipient_type: 'individual',
-      to: repDestinationPhone.replace(/\D/g, ''),
-      type: 'text',
-      text: {
-        preview_url: false, // Keeps the message to a crisp 1-line receipt without login OG card
-        body: receiptLine,
-      },
-    };
+    let requestBody: Record<string, any>;
 
-    // Thread the receipt directly under the approval card if this run went through Step 4
+    if (syncMode === 'AUTO_SYNC' && undoSnapshot) {
+      const undoButtonId = this.signButtonPayload('undo', tenantId, runId);
+      requestBody = {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: repDestinationPhone.replace(/\D/g, ''),
+        type: 'interactive',
+        interactive: {
+          type: 'button',
+          body: {
+            text: receiptLine,
+          },
+          footer: {
+            text: 'Undo window expires in 15 mins',
+          },
+          action: {
+            buttons: [
+              {
+                type: 'reply',
+                reply: {
+                  id: undoButtonId,
+                  title: '↩️ Undo Sync (15m)', // 18 chars (Meta limit is 20)
+                },
+              },
+            ],
+          },
+        },
+      };
+    } else {
+      requestBody = {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: repDestinationPhone.replace(/\D/g, ''),
+        type: 'text',
+        text: {
+          preview_url: false,
+          body: receiptLine,
+        },
+      };
+    }
+
     if (replyToWhatsappMessageId) {
       requestBody.context = { message_id: replyToWhatsappMessageId };
     }
@@ -327,6 +402,57 @@ export class WhatsAppApprovalService {
     }
 
     const result = (await response.json()) as { messages?: Array<{ id: string }> };
-    return { receiptMessageId: result.messages?.[0]?.id ?? 'unknown' };
+    const receiptMessageId = result.messages?.[0]?.id ?? 'unknown';
+
+    // Arm the 15-minute Redis undo snapshot if this was an Auto-Sync
+    if (syncMode === 'AUTO_SYNC' && undoSnapshot) {
+      const fullSnapshot: HubSpotUndoSnapshot = {
+        ...undoSnapshot,
+        receiptWhatsappMessageId: receiptMessageId,
+      };
+      await this.redis.set(
+        this.getUndoKey(tenantId, runId),
+        JSON.stringify(fullSnapshot),
+        'EX',
+        this.UNDO_WINDOW_SECONDS,
+      );
+    }
+
+    return { receiptMessageId };
+  }
+
+  /**
+   * Sends a threaded 1-line notice confirming rollback completion or 15m window expiration
+   */
+  async sendUndoStatusNotice(params: {
+    whatsappPhoneNumberId: string;
+    whatsappAccessToken: string;
+    repDestinationPhone: string;
+    replyToMessageId?: string;
+    text: string;
+  }): Promise<void> {
+    const body: Record<string, any> = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: params.repDestinationPhone.replace(/\D/g, ''),
+      type: 'text',
+      text: { preview_url: false, body: params.text },
+    };
+
+    if (params.replyToMessageId) {
+      body.context = { message_id: params.replyToMessageId };
+    }
+
+    await fetch(
+      `https://graph.facebook.com/${this.GRAPH_API_VERSION}/${params.whatsappPhoneNumberId}/messages`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${params.whatsappAccessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      },
+    );
   }
 }
