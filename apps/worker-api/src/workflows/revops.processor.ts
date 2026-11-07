@@ -224,6 +224,26 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
             throw err;
           }
 
+          // STEP 6: Non-Blocking 1-Line WhatsApp Confirmation Receipt with HubSpot Deep Link
+          try {
+            await anvil.run('step-6-send-whatsapp-receipt', async () => {
+              return this.dispatchCompletionReceipt({
+                tenantId,
+                runId: run.id,
+                mode,
+                hasRepOverride: Boolean(job.data.rawRepOverrideText || editedPatch),
+                crmContext,
+                finalPayload,
+                dealId: syncResult.dealId,
+              });
+            });
+          } catch (receiptErr: any) {
+            // Never fail a completed HubSpot CRM sync if the WhatsApp receipt notification fails
+            this.logger.warn(
+              `[Non-Fatal] Step 5 synced Deal ${syncResult.dealId}, but Step 6 WhatsApp receipt failed: ${receiptErr?.message}`,
+            );
+          }
+
           // Commit final workflow state + audit usage in 1 RLS-pinned transaction
           await this.prisma.$withTenantTransaction(async (tx) => {
             // 1. Uses `tx` explicitly
@@ -410,6 +430,83 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
       senderPhone,
       crmContext,
       payload,
+    });
+  }
+  private async dispatchCompletionReceipt(params: {
+    tenantId: string;
+    runId: string;
+    mode: string;
+    hasRepOverride: boolean;
+    crmContext: ResolvedHubSpotContext;
+    finalPayload: CrmTransitionPayload;
+    dealId: string;
+  }) {
+    const {
+      tenantId,
+      runId,
+      mode,
+      hasRepOverride,
+      crmContext,
+      finalPayload,
+      dealId,
+    } = params;
+
+    const tenant = await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
+    const fallbackPhone =
+      tenant.fallbackApprovalPhone || process.env.DEFAULT_REP_APPROVAL_PHONE!;
+
+    // 1. Resolve Deal Owner -> Rep's bound WhatsApp number from Redis Hash (~0.4ms)
+    const ownerRoute = await this.ownerResolver.resolveApprovalDestination(
+      tenantId,
+      crmContext.contactOwnerId,
+      fallbackPhone,
+    );
+
+    // 2. Map internal HubSpot stage ID (e.g., "14928374") to human-readable label ("Contract Sent")
+    const stages = await this.stageCache.getTenantStages(
+      tenantId,
+      null,
+      crmContext.pipelineId ?? 'default',
+    );
+    const effectiveStageId =
+      finalPayload.dealStage === 'unchanged'
+        ? crmContext.currentDealStage ?? 'appointmentscheduled'
+        : finalPayload.dealStage;
+
+    const matchedStage = stages.find((s) => s.id === effectiveStageId);
+    const stageLabel = matchedStage?.label ?? effectiveStageId;
+
+    // 3. Look up the approval card wamid from Step 4 if we want to thread the reply
+    const step4Record = await this.prisma.workflowStep.findUnique({
+      where: {
+        runId_stepKey: { runId, stepKey: 'step-4-dispatch-approval-prompt' },
+      },
+    });
+    const approvalCardWamid = (step4Record?.outputData as any)?.whatsappMessageId;
+
+    const syncMode =
+      mode === 'RESUME_AFTER_APPROVAL'
+        ? hasRepOverride
+          ? 'REP_OVERRIDDEN'
+          : 'REP_APPROVED'
+        : 'AUTO_SYNC';
+
+    return this.whatsappApproval.sendSyncConfirmationReceipt({
+      whatsappPhoneNumberId: tenant.whatsappPhoneId || process.env.WHATSAPP_PHONE_NUMBER_ID!,
+      whatsappAccessToken: process.env.WHATSAPP_SYSTEM_TOKEN!,
+      repDestinationPhone: ownerRoute.destinationWhatsappPhone,
+      hubspotPortalId: tenant.hubspotPortalId,
+      dealId,
+      dealName:
+        crmContext.currentDealName ??
+        finalPayload.dealName ??
+        crmContext.contactName ??
+        `Deal #${dealId}`,
+      stageLabel,
+      amount: finalPayload.amount ?? crmContext.currentAmount,
+      currency: finalPayload.currency ?? 'USD',
+      syncMode,
+      replyToWhatsappMessageId: approvalCardWamid,
     });
   }
 }

@@ -8,6 +8,19 @@ export interface ParsedButtonApproval {
   tenantId: string;
   runId: string;
 }
+export interface SyncReceiptParams {
+  whatsappPhoneNumberId: string;
+  whatsappAccessToken: string;
+  repDestinationPhone: string;
+  hubspotPortalId: string | null;
+  dealId: string;
+  dealName: string;
+  stageLabel: string;
+  amount: number | null;
+  currency: string | null;
+  syncMode: 'AUTO_SYNC' | 'REP_APPROVED' | 'REP_OVERRIDDEN';
+  replyToWhatsappMessageId?: string; // Threads receipt under the approval card if present
+}
 
 export interface PendingApprovalPointer {
   tenantId: string;
@@ -20,7 +33,7 @@ export class WhatsAppApprovalService {
   private readonly GRAPH_API_VERSION = 'v21.0';
   private readonly SESSION_TTL_SECONDS = 24 * 3600; // 24-hour approval window
 
-  constructor(private readonly redis: Redis) {}
+  constructor(private readonly redis: Redis) { }
 
   private getMsgPointerKey(whatsappMessageId: string): string {
     return `vexel:wa:msg:${whatsappMessageId}`;
@@ -55,6 +68,7 @@ export class WhatsAppApprovalService {
       return null;
     }
 
+
     const expectedFull = this.signButtonPayload(rawAction, tenantId, runId);
     const expectedMac = expectedFull.split(':')[4];
 
@@ -66,7 +80,6 @@ export class WhatsAppApprovalService {
 
     return { action: rawAction, tenantId, runId };
   }
-
   /**
    * Call immediately after sendRepApprovalCard() receives the wamid from Meta Graph API
    */
@@ -231,5 +244,89 @@ export class WhatsAppApprovalService {
 
     const result = (await response.json()) as { messages?: Array<{ id: string }> };
     return { whatsappMessageId: result.messages?.[0]?.id ?? 'unknown' };
+  }
+
+  /**
+   * Builds HubSpot's canonical Deal object (0-3) URL.
+   * HubSpot automatically redirects app.hubspot.com to app-eu1.hubspot.com for European portals.
+   */
+  buildHubSpotDealUrl(hubspotPortalId: string | null, dealId: string): string {
+    if (!hubspotPortalId) {
+      return `https://app.hubspot.com`;
+    }
+    return `https://app.hubspot.com/contacts/${hubspotPortalId}/record/0-3/${dealId}`;
+  }
+
+  /**
+   * Sends a 1-line confirmation receipt with a direct HubSpot Deal link back to the sales rep
+   */
+  async sendSyncConfirmationReceipt(
+    params: SyncReceiptParams,
+  ): Promise<{ receiptMessageId: string }> {
+    const {
+      whatsappPhoneNumberId,
+      whatsappAccessToken,
+      repDestinationPhone,
+      hubspotPortalId,
+      dealId,
+      dealName,
+      stageLabel,
+      amount,
+      currency,
+      syncMode,
+      replyToWhatsappMessageId,
+    } = params;
+
+    const dealUrl = this.buildHubSpotDealUrl(hubspotPortalId, dealId);
+    const formattedAmount =
+      amount !== null
+        ? ` • ${amount.toLocaleString()} ${currency ?? 'USD'}`
+        : '';
+
+    const modeBadge =
+      syncMode === 'REP_OVERRIDDEN'
+        ? '✅ *Vexel Patched & Synced*'
+        : syncMode === 'REP_APPROVED'
+          ? '✅ *Vexel Approved & Synced*'
+          : '⚡ *Vexel Auto-Synced*';
+
+    // Strict 1-line receipt format with direct HubSpot deep link
+    const receiptLine = `${modeBadge}: *${dealName}* → *${stageLabel}*${formattedAmount} — ${dealUrl}`;
+
+    const requestBody: Record<string, any> = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: repDestinationPhone.replace(/\D/g, ''),
+      type: 'text',
+      text: {
+        preview_url: false, // Keeps the message to a crisp 1-line receipt without login OG card
+        body: receiptLine,
+      },
+    };
+
+    // Thread the receipt directly under the approval card if this run went through Step 4
+    if (replyToWhatsappMessageId) {
+      requestBody.context = { message_id: replyToWhatsappMessageId };
+    }
+
+    const response = await fetch(
+      `https://graph.facebook.com/${this.GRAPH_API_VERSION}/${whatsappPhoneNumberId}/messages`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${whatsappAccessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(requestBody),
+      },
+    );
+
+    if (!response.ok) {
+      const errBody = await response.text();
+      throw new Error(`WhatsApp receipt dispatch failed (${response.status}): ${errBody}`);
+    }
+
+    const result = (await response.json()) as { messages?: Array<{ id: string }> };
+    return { receiptMessageId: result.messages?.[0]?.id ?? 'unknown' };
   }
 }
