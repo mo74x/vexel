@@ -1,6 +1,36 @@
 import Redis from 'ioredis';
+import { createHash, randomInt, timingSafeEqual } from 'crypto';
 import { VexelPrismaClient } from '@vexel/database';
 import { HubSpotHttpClient } from '../client/hubspot-http.client';
+
+export interface RepLinkOtpChallenge {
+  otpCode: string;
+  email: string;
+  fullName: string;
+  hubspotOwnerId: string;
+  expiresInSeconds: number;
+}
+
+export type RepLinkOtpVerificationResult =
+  | {
+      status: 'verified';
+      fullName: string;
+      hubspotOwnerId: string;
+      email: string;
+    }
+  | {
+      status: 'invalid_or_expired' | 'max_attempts_exceeded';
+    };
+
+interface PendingRepLinkOtpSession {
+  tenantId: string;
+  hubspotOwnerId: string;
+  email: string;
+  fullName: string;
+  e164Phone: string;
+  otpHash: string;
+  attempts: number;
+}
 
 export interface ResolvedOwnerRoute {
   hubspotOwnerId: string | null;
@@ -29,6 +59,8 @@ interface HubSpotOwnerApiResponse {
 
 export class HubSpotOwnerResolverService {
   private readonly CACHE_TTL_SECONDS = 12 * 3600; // 12 hours
+  private readonly OTP_TTL_SECONDS = 600; // 10 minutes
+  private readonly MAX_OTP_ATTEMPTS = 5;
 
   constructor(
     private readonly prisma: VexelPrismaClient,
@@ -38,6 +70,14 @@ export class HubSpotOwnerResolverService {
 
   private getHashKey(tenantId: string): string {
     return `vexel:owners:${tenantId}`;
+  }
+
+  private getLinkOtpKey(tenantId: string, e164Phone: string): string {
+    return `vexel:rep-link-otp:${tenantId}:${e164Phone}`;
+  }
+
+  private hashOtp(otpCode: string): string {
+    return createHash('sha256').update(otpCode.trim()).digest('hex');
   }
 
   /**
@@ -256,6 +296,123 @@ export class HubSpotOwnerResolverService {
     return {
       fullName: updated.fullName,
       hubspotOwnerId: updated.hubspotOwnerId,
+    };
+  }
+
+  /**
+   * Step 1 of Two-Step Rep Self-Linking (/link <email>):
+   * Verifies the corporate email exists in HubSpot Owners, generates a 6-digit OTP,
+   * stores its SHA-256 hash in Redis for 10 minutes, and returns the challenge for email delivery.
+   */
+  async requestRepLinkOtp(
+    tenantId: string,
+    repEmailInput: string,
+    rawSenderPhone: string,
+  ): Promise<RepLinkOtpChallenge | null> {
+    const normalizedEmail = repEmailInput.toLowerCase().trim();
+    const e164Phone = `+${rawSenderPhone.replace(/\D/g, '')}`;
+
+    const existingCount = await this.prisma.tenantRep.count({ where: { tenantId } });
+    if (existingCount === 0) {
+      await this.syncAllOwnersFromHubSpot(tenantId);
+    }
+
+    const rep = await this.prisma.tenantRep.findUnique({
+      where: {
+        tenantId_email: { tenantId, email: normalizedEmail },
+      },
+    });
+
+    if (!rep || !rep.isActive) {
+      return null;
+    }
+
+    const otpCode = randomInt(100_000, 1_000_000).toString();
+    const session: PendingRepLinkOtpSession = {
+      tenantId,
+      hubspotOwnerId: rep.hubspotOwnerId,
+      email: rep.email,
+      fullName: rep.fullName,
+      e164Phone,
+      otpHash: this.hashOtp(otpCode),
+      attempts: 0,
+    };
+
+    await this.redis.set(
+      this.getLinkOtpKey(tenantId, e164Phone),
+      JSON.stringify(session),
+      'EX',
+      this.OTP_TTL_SECONDS,
+    );
+
+    return {
+      otpCode,
+      email: rep.email,
+      fullName: rep.fullName,
+      hubspotOwnerId: rep.hubspotOwnerId,
+      expiresInSeconds: this.OTP_TTL_SECONDS,
+    };
+  }
+
+  /**
+   * Step 2 of Two-Step Rep Self-Linking (/verify <6-digit-otp>):
+   * Verifies the OTP in constant time with a 5-attempt brute-force ceiling before
+   * binding the WhatsApp senderPhone to the HubSpot Owner record.
+   */
+  async verifyRepLinkOtp(
+    tenantId: string,
+    rawSenderPhone: string,
+    otpInput: string,
+  ): Promise<RepLinkOtpVerificationResult> {
+    const e164Phone = `+${rawSenderPhone.replace(/\D/g, '')}`;
+    const otpKey = this.getLinkOtpKey(tenantId, e164Phone);
+    const rawSession = await this.redis.get(otpKey);
+
+    if (!rawSession) {
+      return { status: 'invalid_or_expired' };
+    }
+
+    const session = JSON.parse(rawSession) as PendingRepLinkOtpSession;
+    if (session.attempts >= this.MAX_OTP_ATTEMPTS) {
+      await this.redis.del(otpKey);
+      return { status: 'max_attempts_exceeded' };
+    }
+
+    const candidateHash = this.hashOtp(otpInput);
+    const expectedBuf = Buffer.from(session.otpHash, 'hex');
+    const candidateBuf = Buffer.from(candidateHash, 'hex');
+
+    const isMatch =
+      expectedBuf.length === candidateBuf.length &&
+      timingSafeEqual(expectedBuf, candidateBuf);
+
+    if (!isMatch) {
+      session.attempts += 1;
+      if (session.attempts >= this.MAX_OTP_ATTEMPTS) {
+        await this.redis.del(otpKey);
+        return { status: 'max_attempts_exceeded' };
+      }
+
+      await this.redis.set(
+        otpKey,
+        JSON.stringify(session),
+        'EX',
+        this.OTP_TTL_SECONDS,
+      );
+      return { status: 'invalid_or_expired' };
+    }
+
+    await this.redis.del(otpKey);
+    const bound = await this.bindRepWhatsAppByEmail(tenantId, session.email, e164Phone);
+    if (!bound) {
+      return { status: 'invalid_or_expired' };
+    }
+
+    return {
+      status: 'verified',
+      fullName: bound.fullName,
+      hubspotOwnerId: bound.hubspotOwnerId,
+      email: session.email,
     };
   }
 

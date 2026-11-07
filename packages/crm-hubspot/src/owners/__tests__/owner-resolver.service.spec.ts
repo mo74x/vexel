@@ -2,6 +2,7 @@ import { HubSpotOwnerResolverService } from '../owner-resolver.service';
 
 describe('HubSpotOwnerResolverService', () => {
   let hashStore: Map<string, string>;
+  let kvStore: Map<string, string>;
   let dbReps: Map<string, any>;
   let mockRedis: any;
   let mockPrisma: any;
@@ -10,9 +11,19 @@ describe('HubSpotOwnerResolverService', () => {
 
   beforeEach(() => {
     hashStore = new Map<string, string>();
+    kvStore = new Map<string, string>();
     dbReps = new Map<string, any>();
 
     mockRedis = {
+      get: async (key: string) => kvStore.get(key) ?? null,
+      set: async (key: string, val: string) => {
+        kvStore.set(key, val);
+        return 'OK';
+      },
+      del: async (key: string) => {
+        kvStore.delete(key);
+        return 1;
+      },
       hget: async (_hash: string, field: string) => hashStore.get(field) ?? null,
       hset: async (_hash: string, field: string, val: string) => {
         hashStore.set(field, val);
@@ -145,6 +156,43 @@ describe('HubSpotOwnerResolverService', () => {
     );
     expect(directRoute.isFallbackRoute).toBe(false);
     expect(directRoute.destinationWhatsappPhone).toBe('+201223344556');
+  });
+
+  it('enforces two-step OTP verification (/link + /verify) and locks out after 5 wrong OTP attempts', async () => {
+    const challenge = await service.requestRepLinkOtp(
+      'tenant_1',
+      'sara.kamel@company.com',
+      '201223344556',
+    );
+    expect(challenge).not.toBeNull();
+    expect(challenge?.otpCode).toMatch(/^\d{6}$/);
+    expect(challenge?.email).toBe('sara.kamel@company.com');
+
+    // Wrong OTP attempt 1 -> invalid_or_expired
+    const badAttempt = await service.verifyRepLinkOtp('tenant_1', '201223344556', '000000');
+    expect(badAttempt).toEqual({ status: 'invalid_or_expired' });
+
+    // Correct OTP -> binds WhatsApp and clears OTP session
+    const verified = await service.verifyRepLinkOtp(
+      'tenant_1',
+      '201223344556',
+      challenge!.otpCode,
+    );
+    expect(verified).toEqual({
+      status: 'verified',
+      fullName: 'Sara Kamel',
+      hubspotOwnerId: '74829104',
+      email: 'sara.kamel@company.com',
+    });
+
+    // Brute-force protection: 5 wrong attempts evict the OTP session
+    await service.requestRepLinkOtp('tenant_1', 'sara.kamel@company.com', '201999999999');
+    for (let i = 0; i < 4; i++) {
+      const res = await service.verifyRepLinkOtp('tenant_1', '201999999999', '000000');
+      expect(res.status).toBe('invalid_or_expired');
+    }
+    const fifthAttempt = await service.verifyRepLinkOtp('tenant_1', '201999999999', '000000');
+    expect(fifthAttempt).toEqual({ status: 'max_attempts_exceeded' });
   });
 });
 

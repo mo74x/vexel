@@ -124,16 +124,29 @@ export class WhatsAppApprovalService {
   /**
    * Atomically pops the 15-minute undo snapshot from Redis using GETDEL.
    * Returns null if the 15-minute window expired or if already clicked.
+   * If expectedSenderPhone is provided and does not match snapshot.repPhone,
+   * re-arms the snapshot and throws an unauthorized sender error.
    */
   async consumeUndoSnapshot(
     tenantId: string,
     runId: string,
+    expectedSenderPhone?: string,
   ): Promise<HubSpotUndoSnapshot | null> {
-    const raw = await this.redis.getdel(this.getUndoKey(tenantId, runId));
+    const key = this.getUndoKey(tenantId, runId);
+    const raw = await this.redis.getdel(key);
     if (!raw) {
       return null;
     }
-    return JSON.parse(raw) as HubSpotUndoSnapshot;
+    const snapshot = JSON.parse(raw) as HubSpotUndoSnapshot;
+    if (
+      expectedSenderPhone &&
+      snapshot.repPhone &&
+      this.normalizePhone(expectedSenderPhone) !== this.normalizePhone(snapshot.repPhone)
+    ) {
+      await this.redis.set(key, raw, 'EX', this.UNDO_WINDOW_SECONDS);
+      throw new Error('Unauthorized sender for undo rollback');
+    }
+    return snapshot;
   }
 
   /**
@@ -154,12 +167,23 @@ export class WhatsAppApprovalService {
   async consumeForceUndoSnapshot(
     tenantId: string,
     runId: string,
+    expectedSenderPhone?: string,
   ): Promise<HubSpotUndoSnapshot | null> {
-    const raw = await this.redis.getdel(this.getForceUndoKey(tenantId, runId));
+    const key = this.getForceUndoKey(tenantId, runId);
+    const raw = await this.redis.getdel(key);
     if (!raw) {
       return null;
     }
-    return JSON.parse(raw) as HubSpotUndoSnapshot;
+    const snapshot = JSON.parse(raw) as HubSpotUndoSnapshot;
+    if (
+      expectedSenderPhone &&
+      snapshot.repPhone &&
+      this.normalizePhone(expectedSenderPhone) !== this.normalizePhone(snapshot.repPhone)
+    ) {
+      await this.redis.set(key, raw, 'EX', this.UNDO_WINDOW_SECONDS);
+      throw new Error('Unauthorized sender for force-undo rollback');
+    }
+    return snapshot;
   }
   /**
    * Call immediately after sendRepApprovalCard() receives the wamid from Meta Graph API
@@ -199,7 +223,13 @@ export class WhatsAppApprovalService {
     if (quotedWhatsappMessageId) {
       const byQuote = await this.redis.get(this.getMsgPointerKey(quotedWhatsappMessageId));
       if (byQuote) {
-        return JSON.parse(byQuote) as PendingApprovalPointer;
+        const parsed = JSON.parse(byQuote) as PendingApprovalPointer;
+        if (
+          parsed.tenantId === tenantId &&
+          this.normalizePhone(parsed.repPhone) === this.normalizePhone(senderPhone)
+        ) {
+          return parsed;
+        }
       }
     }
 
