@@ -4,7 +4,7 @@ import { AppModule } from './app.module';
 import { prisma } from '@vexel/database';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create(AppModule, { rawBody: true });
 
   // Ensures BullMQ workers drain active jobs before OnModuleDestroy closes Prisma & Redis
   app.enableShutdownHooks();

@@ -1,15 +1,20 @@
 import {
   Controller,
+  Get,
   Post,
   Param,
+  Query,
   Body,
   Headers,
+  Req,
   HttpCode,
   BadRequestException,
+  ForbiddenException,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
-import { createHash } from 'crypto';
+import { createHash, createHmac, timingSafeEqual } from 'crypto';
 import { VexelLockService, InboundEventPayload } from '../redis/vexel-lock.service';
 import {
   EnvelopeCryptoService,
@@ -48,19 +53,49 @@ export class WebhooksController {
     );
   }
 
+  @Get(':tenantId/ingest')
+  @HttpCode(200)
+  verifyWebhookChallenge(
+    @Param('tenantId') _tenantId: string,
+    @Query('hub.mode') mode?: string,
+    @Query('hub.verify_token') verifyToken?: string,
+    @Query('hub.challenge') challenge?: string,
+  ): string {
+    const expectedToken = process.env.META_WEBHOOK_VERIFY_TOKEN;
+    if (mode !== 'subscribe' || !verifyToken || !expectedToken) {
+      throw new ForbiddenException('Invalid webhook verification parameters');
+    }
+
+    const actualBuf = Buffer.from(verifyToken, 'utf8');
+    const expectedBuf = Buffer.from(expectedToken, 'utf8');
+    if (actualBuf.length !== expectedBuf.length || !timingSafeEqual(actualBuf, expectedBuf)) {
+      throw new ForbiddenException('Webhook verify_token mismatch');
+    }
+
+    return challenge ?? '';
+  }
+
   @Post(':tenantId/ingest')
   @HttpCode(202)
   async ingestOmnichannelEvent(
     @Param('tenantId') tenantId: string,
     @Headers('x-hub-signature-256') signature: string,
     @Body() body: any,
+    @Req() req?: { rawBody?: Buffer },
   ) {
+    this.verifyMetaWebhookSignature(signature, body, req?.rawBody);
+    await this.verifyTenantPhoneRouting(tenantId, body);
+
     const rawMsg = body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     const buttonReplyId = rawMsg?.interactive?.button_reply?.id;
 
     if (buttonReplyId && buttonReplyId.startsWith('vexel_act:')) {
       const verified = this.whatsappApproval.verifyAndParseButtonReply(buttonReplyId);
       if (verified) {
+        if (verified.tenantId !== tenantId) {
+          throw new ForbiddenException('Button reply tenantId does not match webhook route');
+        }
+
         if (verified.action === 'undo') {
           return this.handleRepUndoRequest(
             verified.tenantId,
@@ -79,7 +114,7 @@ export class WebhooksController {
           );
         }
 
-        return this.handleRepApproval({
+        return this.enqueueRepApproval({
           tenantId: verified.tenantId,
           runId: verified.runId,
           approved: verified.action === 'approve',
@@ -118,6 +153,7 @@ export class WebhooksController {
             jobId: `resume-override:${pendingApproval.runId}`,
             attempts: 5,
             backoff: { type: 'exponential', delay: 4000 },
+            removeOnComplete: true,
           },
         );
 
@@ -128,22 +164,53 @@ export class WebhooksController {
       }
     }
 
+    // 2b. Two-Step Rep Self-Linking (/link <email> -> /verify <6-digit-otp>)
     if (payload.type === 'text' && payload.text?.trim().toLowerCase().startsWith('/link ')) {
       const emailToBind = payload.text.trim().slice(6).trim();
-      const bound = await TenantContext.run(tenantId, () =>
-        this.ownerResolver.bindRepWhatsAppByEmail(
+      const challenge = await TenantContext.run(tenantId, () =>
+        this.ownerResolver.requestRepLinkOtp(
           tenantId,
           emailToBind,
           payload.senderPhone,
         ),
       );
       return {
-        status: bound ? 'rep_whatsapp_linked' : 'rep_email_not_found_in_hubspot',
-        owner: bound,
+        status: challenge ? 'rep_link_otp_sent' : 'rep_email_not_found_in_hubspot',
+        email: challenge?.email ?? null,
+        expiresInSeconds: challenge?.expiresInSeconds ?? null,
       };
     }
 
-    // 2. Fast SHA-256 edge deduplication
+    if (payload.type === 'text' && payload.text?.trim().toLowerCase().startsWith('/verify ')) {
+      const otpCode = payload.text.trim().slice(8).trim();
+      const verification = await TenantContext.run(tenantId, () =>
+        this.ownerResolver.verifyRepLinkOtp(
+          tenantId,
+          payload.senderPhone,
+          otpCode,
+        ),
+      );
+
+      if (verification.status === 'verified') {
+        return {
+          status: 'rep_whatsapp_linked',
+          owner: {
+            fullName: verification.fullName,
+            hubspotOwnerId: verification.hubspotOwnerId,
+            email: verification.email,
+          },
+        };
+      }
+
+      return {
+        status:
+          verification.status === 'max_attempts_exceeded'
+            ? 'rep_link_otp_locked'
+            : 'rep_link_otp_invalid',
+      };
+    }
+
+    // 3. Fast SHA-256 edge deduplication
     const eventHash = createHash('sha256')
       .update(`${tenantId}:${payload.messageId}`)
       .digest('hex');
@@ -153,16 +220,17 @@ export class WebhooksController {
       return { status: 'duplicate_dropped', messageId: payload.messageId };
     }
 
-    // 3. Push message into Redis sliding-window list
+    // 4. Push message into Redis sliding-window list
     const bufferedCount = await this.lockService.appendToBuffer(
       tenantId,
       payload.senderPhone,
       payload,
     );
 
-    // 4. Upsert or reset the 30s delayed BullMQ job for this sender
+    // 5. Upsert or reset the 30s delayed BullMQ job for this sender
     const debounceJobId = `debounce:${tenantId}:${payload.senderPhone}`;
     const existingJob = await this.workflowQueue.getJob(debounceJobId);
+    let targetJobId = debounceJobId;
 
     if (existingJob) {
       const state = await existingJob.getState();
@@ -175,6 +243,22 @@ export class WebhooksController {
           jobId: debounceJobId,
         };
       }
+
+      if (state === 'waiting' || state === 'paused') {
+        // Job is queued and has not flushed the Redis buffer yet; it will pick up this message
+        return {
+          status: 'buffered_into_waiting_job',
+          bufferedCount,
+          jobId: debounceJobId,
+        };
+      }
+
+      if (state === 'active') {
+        // Active worker already flushed the prior Redis buffer batch; schedule a follow-up generation job
+        targetJobId = `${debounceJobId}:${Date.now()}`;
+      } else if (state === 'completed' || state === 'failed') {
+        await existingJob.remove?.();
+      }
     }
 
     await this.workflowQueue.add(
@@ -185,7 +269,7 @@ export class WebhooksController {
         mode: 'INITIAL_INGEST',
       },
       {
-        jobId: debounceJobId,
+        jobId: targetJobId,
         delay: this.DEBOUNCE_WINDOW_MS,
         attempts: 5,
         backoff: { type: 'exponential', delay: 5000 },
@@ -197,17 +281,30 @@ export class WebhooksController {
       status: 'buffered_and_scheduled',
       bufferedCount,
       executeInMs: this.DEBOUNCE_WINDOW_MS,
+      jobId: targetJobId,
     };
   }
 
   /**
-   * Triggered when a sales rep clicks [Approve & Sync] on WhatsApp or Slack
+   * Internal / external callback when a sales rep approves or rejects a WAITING_APPROVAL run.
+   * Requires x-vexel-api-key header matching VEXEL_INTERNAL_API_KEY (or VEXEL_APPROVAL_HMAC_SECRET).
    */
   @Post('approval-callback')
   @HttpCode(200)
   async handleRepApproval(
+    @Headers('x-vexel-api-key') apiKey: string | undefined,
     @Body() body: { runId: string; tenantId: string; approved: boolean; editedPatch?: Record<string, any> },
   ) {
+    this.verifyInternalApiKey(apiKey);
+    return this.enqueueRepApproval(body);
+  }
+
+  private async enqueueRepApproval(body: {
+    runId: string;
+    tenantId: string;
+    approved: boolean;
+    editedPatch?: Record<string, any>;
+  }) {
     if (!body.runId || !body.tenantId) {
       throw new BadRequestException('Missing runId or tenantId');
     }
@@ -225,6 +322,7 @@ export class WebhooksController {
         jobId: `resume:${body.runId}`,
         attempts: 5,
         backoff: { type: 'exponential', delay: 4000 },
+        removeOnComplete: true,
       },
     );
 
@@ -237,8 +335,20 @@ export class WebhooksController {
     repSenderPhone: string,
     quotedReceiptWamid?: string,
   ) {
-    // Atomically pop the 15-minute snapshot from Redis
-    const snapshot = await this.whatsappApproval.consumeUndoSnapshot(tenantId, runId);
+    let snapshot;
+    try {
+      // Atomically pop the 15-minute snapshot from Redis while verifying sender phone ownership
+      snapshot = await this.whatsappApproval.consumeUndoSnapshot(
+        tenantId,
+        runId,
+        repSenderPhone,
+      );
+    } catch (err: any) {
+      if (err?.message?.includes('Unauthorized sender')) {
+        return { status: 'unauthorized_undo_sender', runId };
+      }
+      throw err;
+    }
 
     if (!snapshot) {
       // Window expired (>15 mins) or already undone -> send immediate notice
@@ -264,6 +374,7 @@ export class WebhooksController {
         jobId: `undo:${runId}`,
         attempts: 5,
         backoff: { type: 'exponential', delay: 3000 },
+        removeOnComplete: true,
       },
     );
 
@@ -276,8 +387,20 @@ export class WebhooksController {
     repSenderPhone: string,
     quotedReceiptWamid?: string,
   ) {
-    // Atomically pop the force-undo snapshot from Redis using GETDEL
-    const snapshot = await this.whatsappApproval.consumeForceUndoSnapshot(tenantId, runId);
+    let snapshot;
+    try {
+      // Atomically pop the force-undo snapshot from Redis using GETDEL while verifying sender phone
+      snapshot = await this.whatsappApproval.consumeForceUndoSnapshot(
+        tenantId,
+        runId,
+        repSenderPhone,
+      );
+    } catch (err: any) {
+      if (err?.message?.includes('Unauthorized sender')) {
+        return { status: 'unauthorized_undo_sender', runId };
+      }
+      throw err;
+    }
 
     if (!snapshot) {
       await this.whatsappApproval.sendUndoStatusNotice({
@@ -302,10 +425,90 @@ export class WebhooksController {
         jobId: `force-undo:${runId}`,
         attempts: 5,
         backoff: { type: 'exponential', delay: 3000 },
+        removeOnComplete: true,
       },
     );
 
     return { status: 'force_undo_rollback_queued', runId };
+  }
+
+  /**
+   * Verifies Meta's X-Hub-Signature-256 HMAC-SHA256 header against META_APP_SECRET.
+   */
+  private verifyMetaWebhookSignature(
+    signature: string | undefined,
+    body: any,
+    rawBody?: Buffer,
+  ): void {
+    const appSecret = process.env.META_APP_SECRET;
+    if (!appSecret) {
+      return;
+    }
+
+    if (!signature || !signature.startsWith('sha256=')) {
+      throw new UnauthorizedException('Missing or malformed X-Hub-Signature-256 header');
+    }
+
+    const payloadBuffer =
+      rawBody ?? Buffer.from(typeof body === 'string' ? body : JSON.stringify(body), 'utf8');
+    const expectedHex = createHmac('sha256', appSecret).update(payloadBuffer).digest('hex');
+    const providedHex = signature.slice('sha256='.length);
+
+    if (
+      providedHex.length !== expectedHex.length ||
+      !/^[0-9a-fA-F]+$/.test(providedHex)
+    ) {
+      throw new UnauthorizedException('Invalid X-Hub-Signature-256 signature');
+    }
+
+    const providedBuf = Buffer.from(providedHex, 'hex');
+    const expectedBuf = Buffer.from(expectedHex, 'hex');
+
+    if (providedBuf.length !== expectedBuf.length || !timingSafeEqual(providedBuf, expectedBuf)) {
+      throw new UnauthorizedException('Invalid X-Hub-Signature-256 signature');
+    }
+  }
+
+  /**
+   * Ensures that when Meta sends metadata.phone_number_id, it matches the Tenant's registered whatsappPhoneId.
+   */
+  private async verifyTenantPhoneRouting(tenantId: string, body: any): Promise<void> {
+    const metadataPhoneId =
+      body?.entry?.[0]?.changes?.[0]?.value?.metadata?.phone_number_id;
+    if (!metadataPhoneId || !this.prisma?.tenant?.findUnique) {
+      return;
+    }
+
+    const tenant = await TenantContext.run(tenantId, () =>
+      this.prisma.tenant.findUnique({
+        where: { id: tenantId },
+        select: { id: true, whatsappPhoneId: true },
+      }),
+    );
+
+    if (!tenant) {
+      throw new ForbiddenException(`Unknown tenantId "${tenantId}"`);
+    }
+
+    if (tenant.whatsappPhoneId && tenant.whatsappPhoneId !== String(metadataPhoneId)) {
+      throw new ForbiddenException(
+        'Webhook metadata.phone_number_id does not match tenant whatsappPhoneId',
+      );
+    }
+  }
+
+  private verifyInternalApiKey(apiKey: string | undefined): void {
+    const expectedSecret =
+      process.env.VEXEL_INTERNAL_API_KEY || process.env.VEXEL_APPROVAL_HMAC_SECRET;
+    if (!expectedSecret || !apiKey) {
+      throw new UnauthorizedException('Missing internal API key');
+    }
+
+    const actualBuf = Buffer.from(apiKey, 'utf8');
+    const expectedBuf = Buffer.from(expectedSecret, 'utf8');
+    if (actualBuf.length !== expectedBuf.length || !timingSafeEqual(actualBuf, expectedBuf)) {
+      throw new UnauthorizedException('Invalid internal API key');
+    }
   }
 
   private normalizePayload(body: any): (InboundEventPayload & { contextMessageId?: string }) | null {

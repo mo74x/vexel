@@ -71,8 +71,12 @@ export class WhatsAppApprovalService {
     return `vexel:wa:msg:${whatsappMessageId}`;
   }
 
+  private normalizePhone(phone: string): string {
+    return phone.replace(/\D/g, '');
+  }
+
   private getRepPointerKey(tenantId: string, repPhone: string): string {
-    const digits = repPhone.replace(/\D/g, '');
+    const digits = this.normalizePhone(repPhone);
     return `vexel:wa:rep:${tenantId}:${digits}`;
   }
 
@@ -224,10 +228,7 @@ export class WhatsAppApprovalService {
       const byQuote = await this.redis.get(this.getMsgPointerKey(quotedWhatsappMessageId));
       if (byQuote) {
         const parsed = JSON.parse(byQuote) as PendingApprovalPointer;
-        if (
-          parsed.tenantId === tenantId &&
-          this.normalizePhone(parsed.repPhone) === this.normalizePhone(senderPhone)
-        ) {
+        if (parsed.tenantId === tenantId) {
           return parsed;
         }
       }
