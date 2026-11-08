@@ -92,6 +92,144 @@ export class HubSpotTokenManagerService {
   }
 
   /**
+   * Exchanges an authorization_code from GET /v1/hubspot/callback with HubSpot OAuth API,
+   * inspects the authenticated portalId via token info API, and seals & stores the initial tokens.
+   */
+  async exchangeAuthorizationCodeAndInstall(params: {
+    tenantId: string;
+    code: string;
+    redirectUri: string;
+  }): Promise<{ portalId: string; expiresInSeconds: number }> {
+    const { tenantId, code, redirectUri } = params;
+
+    const clientId = process.env.HUBSPOT_CLIENT_ID;
+    const clientSecret = process.env.HUBSPOT_CLIENT_SECRET;
+
+    if (!clientId || !clientSecret) {
+      throw new Error('Missing HUBSPOT_CLIENT_ID or HUBSPOT_CLIENT_SECRET environment variable');
+    }
+
+    const formData = new URLSearchParams({
+      grant_type: 'authorization_code',
+      client_id: clientId,
+      client_secret: clientSecret,
+      redirect_uri: redirectUri,
+      code,
+    });
+
+    const response = await fetch('https://api.hubapi.com/oauth/v1/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: formData.toString(),
+    });
+
+    if (!response.ok) {
+      const errBody = await response.json().catch(() => ({}));
+      throw new Error(
+        `HubSpot authorization_code exchange failed (${response.status}): ${JSON.stringify(errBody)}`,
+      );
+    }
+
+    const tokenData = (await response.json()) as HubSpotTokenResponse;
+
+    // Fetch portalId (HubSpot Hub ID) from /oauth/v1/access-tokens/{token}
+    const tokenInfoRes = await fetch(
+      `https://api.hubapi.com/oauth/v1/access-tokens/${tokenData.access_token}`,
+    );
+
+    let portalId = '';
+    if (tokenInfoRes.ok) {
+      const info = (await tokenInfoRes.json().catch(() => ({}))) as { hub_id?: number | string };
+      if (info.hub_id) {
+        portalId = String(info.hub_id);
+      }
+    }
+
+    if (!portalId) {
+      throw new Error('Failed to resolve HubSpot Hub ID from exchanged access token');
+    }
+
+    await this.sealAndStoreInitialTokens({
+      tenantId,
+      portalId,
+      rawAccessToken: tokenData.access_token,
+      rawRefreshToken: tokenData.refresh_token,
+      expiresInSeconds: tokenData.expires_in,
+    });
+
+    return {
+      portalId,
+      expiresInSeconds: tokenData.expires_in,
+    };
+  }
+
+  /**
+   * Disconnects and purges stored HubSpot tokens for a tenant (e.g. on customer uninstall)
+   */
+  async disconnectTenantOAuth(tenantId: string): Promise<void> {
+    await this.prisma.tenant.update({
+      where: { id: tenantId },
+      data: {
+        hubspotAccessToken: null,
+        hubspotRefreshToken: null,
+        hubspotTokenExpires: null,
+      },
+    });
+
+    await this.redis.del(this.getTokenCacheKey(tenantId));
+  }
+
+  /**
+   * Seals and stores a per-tenant Meta WhatsApp Access Token at rest
+   */
+  async sealAndStoreTenantWhatsAppToken(
+    tenantId: string,
+    rawWhatsAppToken: string,
+  ): Promise<void> {
+    const sealedToken = this.crypto.encrypt(
+      rawWhatsAppToken,
+      tenantId,
+      'whatsapp_access_token',
+    );
+
+    await this.prisma.tenant.update({
+      where: { id: tenantId },
+      data: {
+        whatsappAccessToken: sealedToken,
+      },
+    });
+  }
+
+  /**
+   * Resolves the active WhatsApp Access Token for a tenant.
+   * If tenant has a sealed custom whatsappAccessToken, decrypts and returns it.
+   * Otherwise falls back to global process.env.WHATSAPP_SYSTEM_TOKEN.
+   */
+  async getTenantWhatsAppToken(tenantId: string): Promise<string> {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { whatsappAccessToken: true },
+    });
+
+    if (tenant?.whatsappAccessToken) {
+      const decrypted = this.crypto.decrypt(
+        tenant.whatsappAccessToken,
+        tenantId,
+        'whatsapp_access_token',
+      );
+      return decrypted.plaintext;
+    }
+
+    const fallback = process.env.WHATSAPP_SYSTEM_TOKEN;
+    if (!fallback) {
+      throw new Error(
+        `No WhatsApp access token available for tenant "${tenantId}" (tenant token missing and WHATSAPP_SYSTEM_TOKEN unset)`,
+      );
+    }
+    return fallback;
+  }
+
+  /**
    * Returns the decrypted HubSpot access_token in memory only.
    * Both Redis and PostgreSQL store strictly the AES-256-GCM envelope.
    */

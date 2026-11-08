@@ -19,6 +19,12 @@ describe('RevOpsWorkflowProcessor', () => {
 
     mockPrisma = {
       client: {
+        tenant: {
+          findUnique: async () => ({
+            id: 'tenant_acme',
+            whatsappAccessToken: null,
+          }),
+        },
         workflowStep: {
           findUnique: async ({ where }: any) => {
             const key = `${where.runId_stepKey.runId}:${where.runId_stepKey.stepKey}`;

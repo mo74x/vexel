@@ -3,6 +3,7 @@ import { BullModule } from '@nestjs/bullmq';
 import { PrismaService } from '@vexel/database';
 import { VexelLockService } from './redis/vexel-lock.service';
 import { WebhooksController } from './webhooks/webhooks.controller';
+import { TenantOnboardingController } from './onboarding/tenant-onboarding.controller';
 import { RevOpsWorkflowProcessor } from './workflows/revops.processor';
 
 @Module({
@@ -16,7 +17,7 @@ import { RevOpsWorkflowProcessor } from './workflows/revops.processor';
       name: 'vexel-workflows',
     }),
   ],
-  controllers: [WebhooksController],
+  controllers: [WebhooksController, TenantOnboardingController],
   providers: [PrismaService, VexelLockService, RevOpsWorkflowProcessor],
 })
 export class AppModule {}

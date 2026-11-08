@@ -1,6 +1,9 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
 
-export type TokenPurpose = 'hubspot_access_token' | 'hubspot_refresh_token';
+export type TokenPurpose =
+  | 'hubspot_access_token'
+  | 'hubspot_refresh_token'
+  | 'whatsapp_access_token';
 
 interface KeyRing {
   activeVersion: string;

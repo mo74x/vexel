@@ -72,6 +72,16 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
   }
 
   async process(job: Job, token?: string): Promise<any> {
+    // 0. Handle Repeatable Owner Sync Jobs
+    if (job.name === 'sync-hubspot-owners') {
+      const { tenantId } = job.data;
+      return TenantContext.run(tenantId, async () => {
+        this.logger.log(`Executing scheduled HubSpot owner sync for tenant "${tenantId}"`);
+        const outcome = await this.ownerResolver.syncAllOwnersFromHubSpot(tenantId);
+        return { status: 'owners_synced', tenantId, count: outcome.syncedCount };
+      });
+    }
+
     const { tenantId, senderPhone, mode, runId: existingRunId, approved, editedPatch, rawRepOverrideText } = job.data;
 
     // Bind tenantId to AsyncLocalStorage for the entire lifecycle of this BullMQ job
@@ -155,7 +165,9 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
               tenantId,
               runId: run.id,
               whatsappPhoneNumberId: tenant.whatsappPhoneId || process.env.WHATSAPP_PHONE_NUMBER_ID!,
-              whatsappAccessToken: process.env.WHATSAPP_SYSTEM_TOKEN!,
+              whatsappAccessToken:
+                (await this.tokenManager.getTenantWhatsAppToken(tenantId)) ||
+                process.env.WHATSAPP_SYSTEM_TOKEN!,
               repDestinationPhone: snapshot.repPhone,
               replyToMessageId: snapshot.receiptWhatsappMessageId,
               text: conflictText,
@@ -176,7 +188,9 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
 
           await this.whatsappApproval.sendUndoStatusNotice({
             whatsappPhoneNumberId: tenant.whatsappPhoneId || process.env.WHATSAPP_PHONE_NUMBER_ID!,
-            whatsappAccessToken: process.env.WHATSAPP_SYSTEM_TOKEN!,
+            whatsappAccessToken:
+              (await this.tokenManager.getTenantWhatsAppToken(tenantId)) ||
+              process.env.WHATSAPP_SYSTEM_TOKEN!,
             repDestinationPhone: snapshot.repPhone,
             replyToMessageId: snapshot.receiptWhatsappMessageId,
             text: whatsappNoticeText,
@@ -413,10 +427,13 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
 
   private async transcribeAndMergeBatch(tenantId: string, runId: string, messages: any[]) {
     await this.prisma.tenant.findUniqueOrThrow({ where: { id: tenantId } });
+    const waToken =
+      (await this.tokenManager.getTenantWhatsAppToken(tenantId)) ||
+      process.env.WHATSAPP_SYSTEM_TOKEN!;
     return this.bilingualTranscriber.transcribeAndMergeBatch(
       tenantId,
       runId,
-      process.env.WHATSAPP_SYSTEM_TOKEN!,
+      waToken,
       messages,
     );
   }
@@ -472,7 +489,9 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
       tenantId,
       runId,
       whatsappPhoneNumberId: tenant.whatsappPhoneId || process.env.WHATSAPP_PHONE_NUMBER_ID!,
-      whatsappAccessToken: process.env.WHATSAPP_SYSTEM_TOKEN!,
+      whatsappAccessToken:
+        (await this.tokenManager.getTenantWhatsAppToken(tenantId)) ||
+        process.env.WHATSAPP_SYSTEM_TOKEN!,
       repDestinationPhone: ownerRoute.destinationWhatsappPhone,
       crmContext,
       payload: enrichedPayload,
@@ -572,7 +591,9 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
       tenantId,
       runId,
       whatsappPhoneNumberId: tenant.whatsappPhoneId || process.env.WHATSAPP_PHONE_NUMBER_ID!,
-      whatsappAccessToken: process.env.WHATSAPP_SYSTEM_TOKEN!,
+      whatsappAccessToken:
+        (await this.tokenManager.getTenantWhatsAppToken(tenantId)) ||
+        process.env.WHATSAPP_SYSTEM_TOKEN!,
       repDestinationPhone: ownerRoute.destinationWhatsappPhone,
       hubspotPortalId: tenant.hubspotPortalId,
       dealId: syncResult.dealId,
