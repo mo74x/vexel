@@ -1,0 +1,718 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Vexel Customer-Facing Admin API",
+    "version": "1.0.0",
+    "description": "Multi-tenant RevOps Engine dashboard API for monitoring, human-in-the-loop approvals, sales rep linking, and telemetry."
+  },
+  "servers": [
+    {
+      "url": "/v1/app",
+      "description": "Tenant Dashboard API"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "cookieAuth": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "vexel_session",
+        "description": "HttpOnly session cookie created on magic-link verification"
+      },
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque-token",
+        "description": "Alternative session token header for SSR and API clients"
+      }
+    },
+    "schemas": {
+      "RunStatus": {
+        "type": "string",
+        "enum": ["PENDING", "RUNNING", "WAITING_APPROVAL", "COMPLETED", "FAILED", "DEAD_LETTER"]
+      },
+      "RunOutcome": {
+        "type": "string",
+        "enum": [
+          "AUTO_SYNCED",
+          "APPROVED_AS_IS",
+          "APPROVED_WITH_OVERRIDE",
+          "REJECTED",
+          "EXPIRED",
+          "UNDONE",
+          "FAILED"
+        ]
+      },
+      "MembershipRole": {
+        "type": "string",
+        "enum": ["ADMIN", "MANAGER", "SUPPORT"]
+      },
+      "UserProfile": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "email": { "type": "string", "format": "email" },
+          "name": { "type": "string" },
+          "locale": { "type": "string" },
+          "isOperator": { "type": "boolean" },
+          "createdAt": { "type": "string", "format": "date-time" }
+        },
+        "required": ["id", "email", "name", "locale", "isOperator", "createdAt"]
+      },
+      "TenantSummary": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "slug": { "type": "string" },
+          "locale": { "type": "string" },
+          "timezone": { "type": "string" },
+          "autoSyncThreshold": { "type": "integer" },
+          "manualMinutesPerUpdate": { "type": "integer" }
+        },
+        "required": ["id", "name", "slug", "locale", "timezone", "autoSyncThreshold", "manualMinutesPerUpdate"]
+      },
+      "MembershipSummary": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "tenantId": { "type": "string" },
+          "role": { "$ref": "#/components/schemas/MembershipRole" },
+          "tenant": { "$ref": "#/components/schemas/TenantSummary" }
+        },
+        "required": ["id", "tenantId", "role", "tenant"]
+      },
+      "RepSummary": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "fullName": { "type": "string" },
+          "email": { "type": "string", "format": "email" },
+          "whatsappPhone": {
+            "type": ["string", "null"],
+            "description": "Masked (showing last 3 digits) unless caller is ADMIN"
+          }
+        },
+        "required": ["id", "fullName", "email"]
+      },
+      "RunListItem": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "workflowName": { "type": "string" },
+          "externalDealId": { "type": ["string", "null"] },
+          "status": { "$ref": "#/components/schemas/RunStatus" },
+          "outcome": {
+            "anyOf": [{ "$ref": "#/components/schemas/RunOutcome" }, { "type": "null" }]
+          },
+          "confidenceScore": { "type": ["integer", "null"] },
+          "senderPhone": {
+            "type": ["string", "null"],
+            "description": "Masked (showing last 3 digits) unless caller is ADMIN"
+          },
+          "oneLineSummary": { "type": "string" },
+          "overriddenFields": { "type": ["object", "null"] },
+          "errorMessage": { "type": ["string", "null"] },
+          "decidedByRep": {
+            "anyOf": [{ "$ref": "#/components/schemas/RepSummary" }, { "type": "null" }]
+          },
+          "decidedAt": { "type": ["string", "null"], "format": "date-time" },
+          "undoneAt": { "type": ["string", "null"], "format": "date-time" },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "startedAt": { "type": "string", "format": "date-time" },
+          "completedAt": { "type": ["string", "null"], "format": "date-time" }
+        },
+        "required": ["id", "workflowName", "status", "oneLineSummary", "createdAt", "startedAt"]
+      },
+      "RunListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/RunListItem" }
+          },
+          "nextCursor": { "type": ["string", "null"] },
+          "hasMore": { "type": "boolean" },
+          "limit": { "type": "integer" }
+        },
+        "required": ["items", "nextCursor", "hasMore", "limit"]
+      },
+      "WorkflowStepItem": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "stepKey": { "type": "string" },
+          "status": { "type": "string" },
+          "durationMs": { "type": ["integer", "null"] },
+          "executedAt": { "type": "string", "format": "date-time" },
+          "errorLog": { "type": ["string", "null"] },
+          "outputData": { "type": ["object", "null"] }
+        },
+        "required": ["id", "stepKey", "status", "executedAt"]
+      },
+      "RunDetail": {
+        "allOf": [
+          { "$ref": "#/components/schemas/RunListItem" },
+          {
+            "type": "object",
+            "properties": {
+              "inputPayload": { "type": "object" },
+              "extractedData": { "type": ["object", "null"] },
+              "transcript": { "type": ["string", "null"] },
+              "undoAvailable": { "type": "boolean" },
+              "undoType": {
+                "type": ["string", "null"],
+                "enum": ["STANDARD", "FORCE", null]
+              },
+              "steps": {
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/WorkflowStepItem" }
+              }
+            },
+            "required": ["inputPayload", "undoAvailable", "steps"]
+          }
+        ]
+      },
+      "TenantRepRecord": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "tenantId": { "type": "string" },
+          "hubspotOwnerId": { "type": "string" },
+          "email": { "type": "string", "format": "email" },
+          "fullName": { "type": "string" },
+          "whatsappPhone": {
+            "type": ["string", "null"],
+            "description": "Masked (showing last 3 digits) unless caller is ADMIN"
+          },
+          "isActive": { "type": "boolean" },
+          "updatedAt": { "type": "string", "format": "date-time" }
+        },
+        "required": ["id", "tenantId", "hubspotOwnerId", "email", "fullName", "isActive", "updatedAt"]
+      },
+      "MetricsSummary": {
+        "type": "object",
+        "properties": {
+          "window": {
+            "type": "object",
+            "properties": {
+              "from": { "type": "string", "format": "date-time" },
+              "to": { "type": "string", "format": "date-time" }
+            },
+            "required": ["from", "to"]
+          },
+          "totalRuns": { "type": "integer" },
+          "runsByOutcome": {
+            "type": "object",
+            "additionalProperties": { "type": "integer" }
+          },
+          "runsByStatus": {
+            "type": "object",
+            "additionalProperties": { "type": "integer" }
+          },
+          "autoSyncRate": { "type": "number", "description": "Percentage (0-100)" },
+          "approvalRate": { "type": "number", "description": "Percentage of reviewed runs approved" },
+          "editRate": { "type": "number", "description": "Percentage of approved runs with field edits" },
+          "averageConfidence": { "type": ["number", "null"] },
+          "estimatedMinutesSaved": { "type": "number" },
+          "manualMinutesPerUpdate": { "type": "integer" },
+          "totalCostUsd": { "type": "number" }
+        },
+        "required": [
+          "window",
+          "totalRuns",
+          "runsByOutcome",
+          "runsByStatus",
+          "autoSyncRate",
+          "approvalRate",
+          "editRate",
+          "estimatedMinutesSaved",
+          "manualMinutesPerUpdate",
+          "totalCostUsd"
+        ]
+      },
+      "OnboardingStatus": {
+        "type": "object",
+        "properties": {
+          "tenantId": { "type": "string" },
+          "tenantName": { "type": "string" },
+          "tenantSlug": { "type": "string" },
+          "hubspotConnected": { "type": "boolean" },
+          "hubspotPortalId": { "type": ["string", "null"] },
+          "whatsappConnected": { "type": "boolean" },
+          "whatsappPhoneId": { "type": ["string", "null"] },
+          "repsLinkedCount": { "type": "integer" },
+          "totalRepsCount": { "type": "integer" },
+          "firstRunReceived": { "type": "boolean" },
+          "firstRunAt": { "type": ["string", "null"], "format": "date-time" },
+          "autoSyncThreshold": { "type": "integer" },
+          "manualMinutesPerUpdate": { "type": "integer" }
+        },
+        "required": [
+          "tenantId",
+          "tenantName",
+          "tenantSlug",
+          "hubspotConnected",
+          "whatsappConnected",
+          "repsLinkedCount",
+          "totalRepsCount",
+          "firstRunReceived",
+          "autoSyncThreshold",
+          "manualMinutesPerUpdate"
+        ]
+      }
+    }
+  },
+  "security": [
+    { "cookieAuth": [] },
+    { "bearerAuth": [] }
+  ],
+  "paths": {
+    "/auth/magic-link": {
+      "post": {
+        "summary": "Request a passwordless magic-link sign-in email",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "email": { "type": "string", "format": "email" },
+                  "appBaseUrl": { "type": "string" }
+                },
+                "required": ["email"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Magic link email queued if user exists (uniform response)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string", "example": "magic_link_sent" }
+                  }
+                }
+              }
+            }
+          },
+          "429": { "description": "Too many requests (rate limit exceeded)" }
+        }
+      }
+    },
+    "/auth/verify": {
+      "post": {
+        "summary": "Verify single-use magic-link token and establish an httpOnly session",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "token": { "type": "string" },
+                  "tenantId": { "type": "string" }
+                },
+                "required": ["token"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Session established; Set-Cookie header issued",
+            "headers": {
+              "Set-Cookie": {
+                "schema": { "type": "string" },
+                "description": "vexel_session=<token>; HttpOnly; Path=/; Max-Age=604800; SameSite=Lax"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "user": { "$ref": "#/components/schemas/UserProfile" },
+                    "memberships": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/MembershipSummary" }
+                    },
+                    "activeTenant": {
+                      "anyOf": [{ "$ref": "#/components/schemas/TenantSummary" }, { "type": "null" }]
+                    },
+                    "activeRole": {
+                      "anyOf": [{ "$ref": "#/components/schemas/MembershipRole" }, { "type": "null" }]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "description": "Invalid or expired token" }
+        }
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "summary": "Revoke current session and clear session cookie",
+        "responses": {
+          "200": {
+            "description": "Session revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "status": { "type": "string", "example": "logged_out" } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/me": {
+      "get": {
+        "summary": "Get authenticated user profile, memberships, and active tenant",
+        "parameters": [
+          {
+            "name": "x-vexel-tenant-id",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Switch active tenant context (must be a valid membership)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "user": { "$ref": "#/components/schemas/UserProfile" },
+                    "memberships": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/MembershipSummary" }
+                    },
+                    "activeTenant": {
+                      "anyOf": [{ "$ref": "#/components/schemas/TenantSummary" }, { "type": "null" }]
+                    },
+                    "activeRole": {
+                      "anyOf": [{ "$ref": "#/components/schemas/MembershipRole" }, { "type": "null" }]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Cross-tenant access denied" }
+        }
+      }
+    },
+    "/runs": {
+      "get": {
+        "summary": "Cursor-paginated list of workflow runs for the active tenant (newest first)",
+        "parameters": [
+          { "name": "status", "in": "query", "schema": { "$ref": "#/components/schemas/RunStatus" } },
+          { "name": "outcome", "in": "query", "schema": { "$ref": "#/components/schemas/RunOutcome" } },
+          { "name": "repId", "in": "query", "schema": { "type": "string" } },
+          { "name": "from", "in": "query", "schema": { "type": "string", "format": "date-time" } },
+          { "name": "to", "in": "query", "schema": { "type": "string", "format": "date-time" } },
+          { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 20, "maximum": 100 } }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RunListResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/runs/{id}": {
+      "get": {
+        "summary": "Detailed view of a workflow run including steps, transcript, and undo availability",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RunDetail" }
+              }
+            }
+          },
+          "404": { "description": "Run not found" }
+        }
+      }
+    },
+    "/runs/{id}/approve": {
+      "post": {
+        "summary": "Approve a WAITING_APPROVAL run (ADMIN or MANAGER only)",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "editedPatch": { "type": "object", "description": "Optional CRM field overrides" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string", "example": "workflow_resumed" },
+                    "runId": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Run is not in WAITING_APPROVAL status" },
+          "403": { "description": "Requires ADMIN or MANAGER role" }
+        }
+      }
+    },
+    "/runs/{id}/reject": {
+      "post": {
+        "summary": "Reject a WAITING_APPROVAL run (ADMIN or MANAGER only)",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "reason": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string", "example": "workflow_rejected" },
+                    "runId": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Run is not in WAITING_APPROVAL status" },
+          "403": { "description": "Requires ADMIN or MANAGER role" }
+        }
+      }
+    },
+    "/runs/{id}/replay": {
+      "post": {
+        "summary": "Replay a DEAD_LETTER or FAILED run (ADMIN or MANAGER only)",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string", "example": "dlq_run_requeued" },
+                    "runId": { "type": "string" },
+                    "jobId": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Run is not in DEAD_LETTER or FAILED status" },
+          "403": { "description": "Requires ADMIN or MANAGER role" }
+        }
+      }
+    },
+    "/reps": {
+      "get": {
+        "summary": "List sales reps for the active tenant (phone masked unless caller is ADMIN)",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/TenantRepRecord" }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Add a new sales rep to the tenant (ADMIN or MANAGER only)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "hubspotOwnerId": { "type": "string" },
+                  "email": { "type": "string", "format": "email" },
+                  "fullName": { "type": "string" },
+                  "whatsappPhone": { "type": "string", "example": "+201012345678" },
+                  "isActive": { "type": "boolean", "default": true }
+                },
+                "required": ["hubspotOwnerId", "email", "fullName"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TenantRepRecord" }
+              }
+            }
+          },
+          "403": { "description": "Requires ADMIN or MANAGER role" }
+        }
+      }
+    },
+    "/reps/{id}": {
+      "patch": {
+        "summary": "Update an existing sales rep (ADMIN or MANAGER only)",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "fullName": { "type": "string" },
+                  "email": { "type": "string", "format": "email" },
+                  "whatsappPhone": { "type": ["string", "null"] },
+                  "isActive": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TenantRepRecord" }
+              }
+            }
+          },
+          "404": { "description": "Rep not found" }
+        }
+      }
+    },
+    "/reps/{id}/send-link-code": {
+      "post": {
+        "summary": "Generate a 6-digit OTP challenge to bind a rep's WhatsApp number (ADMIN or MANAGER only)",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string", "example": "otp_sent" },
+                    "email": { "type": "string" },
+                    "expiresInSeconds": { "type": "integer", "example": 600 }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "summary": "Calculate aggregate metrics (outcomes, autoSyncRate, approvalRate, editRate, saved minutes, UsageLedger cost)",
+        "parameters": [
+          { "name": "from", "in": "query", "schema": { "type": "string", "format": "date-time" } },
+          { "name": "to", "in": "query", "schema": { "type": "string", "format": "date-time" } }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MetricsSummary" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/onboarding/status": {
+      "get": {
+        "summary": "Integration health check (HubSpot, WhatsApp, linked reps count, first run received)",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/OnboardingStatus" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "Download OpenAPI 3.1 schema specification",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "OpenAPI 3.1 Specification JSON",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
