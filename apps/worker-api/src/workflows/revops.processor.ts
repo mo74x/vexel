@@ -1,7 +1,7 @@
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job, DelayedError, UnrecoverableError } from 'bullmq';
 import { Logger } from '@nestjs/common';
-import { PrismaClient, RunStatus } from '@prisma/client';
+import { PrismaClient, RunOutcome, RunStatus } from '@prisma/client';
 import { PrismaService, TenantContext } from '@vexel/database';
 import { createHash } from 'crypto';
 import { VexelLockService } from '../redis/vexel-lock.service';
@@ -27,6 +27,35 @@ import {
   UsageMeterService,
   ZodExtractorService,
 } from '@vexel/extractor';
+
+const IGNORED_DIFF_KEYS = new Set([
+  'confidenceScore',
+  'confidenceReasoning',
+  'detectedLanguage',
+]);
+
+export function computeOverriddenFieldsDiff(
+  extracted: Record<string, any> | null | undefined,
+  finalPayload: Record<string, any> | null | undefined,
+): Record<string, { from: any; to: any }> | null {
+  if (!extracted || !finalPayload) {
+    return null;
+  }
+
+  const diff: Record<string, { from: any; to: any }> = {};
+  const keys = new Set([...Object.keys(extracted), ...Object.keys(finalPayload)]);
+
+  for (const key of keys) {
+    if (IGNORED_DIFF_KEYS.has(key)) continue;
+    const fromVal = extracted[key] ?? null;
+    const toVal = finalPayload[key] ?? null;
+    if (JSON.stringify(fromVal) !== JSON.stringify(toVal)) {
+      diff[key] = { from: fromVal, to: toVal };
+    }
+  }
+
+  return Object.keys(diff).length > 0 ? diff : null;
+}
 
 @Processor('vexel-workflows', { concurrency: 10 })
 export class RevOpsWorkflowProcessor extends WorkerHost {
@@ -118,9 +147,30 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
 
         // Handle Rep Rejection if resuming from approval
         if (mode === 'RESUME_AFTER_APPROVAL' && approved === false) {
+          const actor = await this.resolveRepActor(tenantId, job.data);
+          const decidedAt = new Date();
           await this.prisma.workflowRun.update({
             where: { id: run.id },
-            data: { status: RunStatus.COMPLETED, completedAt: new Date() },
+            data: {
+              status: RunStatus.COMPLETED,
+              outcome: RunOutcome.REJECTED,
+              decidedByRepId: actor.repId,
+              decidedAt,
+              completedAt: decidedAt,
+            },
+          });
+          await this.recordAuditLog({
+            tenantId,
+            actorUserId: actor.userId,
+            action: 'workflow_run.rejected',
+            targetType: 'WorkflowRun',
+            targetId: run.id,
+            meta: {
+              outcome: RunOutcome.REJECTED,
+              decidedByRepId: actor.repId,
+              repPhone: actor.repPhone,
+              repEmail: actor.repEmail,
+            },
           });
           return { status: 'rejected_by_rep', runId: run.id };
         }
@@ -137,10 +187,36 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
             },
           );
 
+          const undoneAt = new Date();
+          const actor = await this.resolveRepActor(tenantId, {
+            ...job.data,
+            repPhone: snapshot.repPhone,
+          });
+
           await this.prisma.workflowRun.update({
             where: { id: run.id },
             data: {
+              outcome: RunOutcome.UNDONE,
+              undoneAt,
               errorMessage: `Undo executed (${forceOverwrite ? 'FORCE' : 'STANDARD'}): ${rollbackOutcome.dealAction} (Conflicts: ${rollbackOutcome.conflictingFields.join(', ') || 'none'})`,
+            },
+          });
+
+          await this.recordAuditLog({
+            tenantId,
+            actorUserId: actor.userId,
+            action: forceOverwrite ? 'workflow_run.force_undone' : 'workflow_run.undone',
+            targetType: 'WorkflowRun',
+            targetId: run.id,
+            meta: {
+              outcome: RunOutcome.UNDONE,
+              dealId: snapshot.dealId,
+              dealAction: rollbackOutcome.dealAction,
+              conflictingFields: rollbackOutcome.conflictingFields,
+              forceOverwrite,
+              decidedByRepId: actor.repId,
+              repPhone: snapshot.repPhone,
+              repEmail: actor.repEmail,
             },
           });
 
@@ -261,15 +337,46 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
             });
 
             if (overrideResult.action === 'REJECT') {
+              const actor = await this.resolveRepActor(
+                tenantId,
+                job.data,
+                crmContext.contactOwnerId,
+              );
+              const decidedAt = new Date();
               await this.prisma.workflowRun.update({
                 where: { id: run.id },
-                data: { status: RunStatus.COMPLETED, completedAt: new Date() },
+                data: {
+                  status: RunStatus.COMPLETED,
+                  outcome: RunOutcome.REJECTED,
+                  decidedByRepId: actor.repId,
+                  decidedAt,
+                  completedAt: decidedAt,
+                },
+              });
+              await this.recordAuditLog({
+                tenantId,
+                actorUserId: actor.userId,
+                action: 'workflow_run.rejected',
+                targetType: 'WorkflowRun',
+                targetId: run.id,
+                meta: {
+                  outcome: RunOutcome.REJECTED,
+                  decidedByRepId: actor.repId,
+                  repPhone: actor.repPhone,
+                  repEmail: actor.repEmail,
+                  rawRepOverrideText: job.data.rawRepOverrideText,
+                },
               });
               return { status: 'rejected_by_rep_text', runId: run.id };
             }
 
             finalPayload = overrideResult.mergedPayload;
           }
+
+          const isHumanApproval = mode === 'RESUME_AFTER_APPROVAL';
+          const overriddenFields = isHumanApproval
+            ? computeOverriddenFieldsDiff(extraction, finalPayload)
+            : null;
 
           // STEP 5: Idempotent HubSpot v4 Batch Sync with Stale-Stage Recovery
           let syncResult: HubSpotSyncOutcome;
@@ -316,7 +423,7 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
                 tenantId,
                 runId: run.id,
                 mode,
-                hasRepOverride: Boolean(job.data.rawRepOverrideText || editedPatch),
+                hasRepOverride: Boolean(overriddenFields),
                 crmContext,
                 finalPayload,
                 syncResult,
@@ -329,6 +436,17 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
             );
           }
 
+          const completedAt = new Date();
+          const finalOutcome = isHumanApproval
+            ? overriddenFields
+              ? RunOutcome.APPROVED_WITH_OVERRIDE
+              : RunOutcome.APPROVED_AS_IS
+            : RunOutcome.AUTO_SYNCED;
+
+          const approvalActor = isHumanApproval
+            ? await this.resolveRepActor(tenantId, job.data, crmContext.contactOwnerId)
+            : null;
+
           // Commit final workflow state + audit usage in 1 RLS-pinned transaction
           await this.prisma.$withTenantTransaction(async (tx) => {
             // 1. Uses `tx` explicitly
@@ -336,12 +454,44 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
               where: { id: run.id },
               data: {
                 status: RunStatus.COMPLETED,
+                outcome: finalOutcome,
+                ...(isHumanApproval
+                  ? {
+                      overriddenFields: (overriddenFields ?? null) as any,
+                      decidedByRepId: approvalActor?.repId ?? null,
+                      decidedAt: completedAt,
+                    }
+                  : {}),
                 externalDealId: syncResult.dealId,
                 extractedData: finalPayload as any,
                 confidenceScore: finalPayload.confidenceScore,
-                completedAt: new Date(),
+                completedAt,
               },
             });
+
+            if (isHumanApproval && approvalActor) {
+              await this.recordAuditLog(
+                {
+                  tenantId,
+                  actorUserId: approvalActor.userId,
+                  action:
+                    finalOutcome === RunOutcome.APPROVED_WITH_OVERRIDE
+                      ? 'workflow_run.approved_with_override'
+                      : 'workflow_run.approved_as_is',
+                  targetType: 'WorkflowRun',
+                  targetId: run.id,
+                  meta: {
+                    outcome: finalOutcome,
+                    dealId: syncResult.dealId,
+                    decidedByRepId: approvalActor.repId,
+                    repPhone: approvalActor.repPhone,
+                    repEmail: approvalActor.repEmail,
+                    overriddenFields,
+                  },
+                },
+                tx,
+              );
+            }
 
             // 2. Ambiently reuses the exact same PostgreSQL connection & set_config session
             // even though UsageMeterService calls `this.prisma.usageLedger.create()` internally!
@@ -372,10 +522,30 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
               where: { id: run.id },
               data: {
                 status: RunStatus.DEAD_LETTER,
+                outcome: RunOutcome.FAILED,
+                completedAt: new Date(),
                 errorMessage: err.message,
               },
             });
             throw new UnrecoverableError(err.message);
+          }
+
+          // 3. Final attempt failure on non-self-healing errors -> mark FAILED
+          const maxAttempts = job?.opts?.attempts ?? 1;
+          const isFinalAttempt = (job?.attemptsMade ?? 0) + 1 >= maxAttempts;
+          const isStaleStage =
+            err?.isStaleDealStage === true || err?.name === 'StaleDealStageError';
+
+          if (isFinalAttempt && !isStaleStage && this.prisma.workflowRun?.updateMany) {
+            await this.prisma.workflowRun.updateMany({
+              where: { id: run.id },
+              data: {
+                status: RunStatus.FAILED,
+                outcome: RunOutcome.FAILED,
+                completedAt: new Date(),
+                errorMessage: err?.message ?? 'Workflow execution failed',
+              },
+            });
           }
 
           throw err;
@@ -384,6 +554,116 @@ export class RevOpsWorkflowProcessor extends WorkerHost {
         clearInterval(heartbeat);
         await this.lockService.releaseDealLock(tenantId, lockEntityKey, lockToken);
       }
+    });
+  }
+
+  private async resolveRepActor(
+    tenantId: string,
+    jobData: Record<string, any>,
+    fallbackHubspotOwnerId?: string | null,
+  ): Promise<{
+    repId: string | null;
+    repPhone: string | null;
+    repEmail: string | null;
+    userId: string | null;
+  }> {
+    let repId: string | null = jobData?.decidedByRepId ?? null;
+    let repPhone: string | null =
+      jobData?.repPhone ?? jobData?.undoSnapshot?.repPhone ?? null;
+    let repEmail: string | null = null;
+    let userId: string | null = jobData?.actorUserId ?? null;
+
+    const tenantRepDelegate =
+      (this.prisma as any).tenantRep ?? (this.prisma.client as any)?.tenantRep;
+
+    if (tenantRepDelegate) {
+      let repRecord: any = null;
+
+      if (repId && tenantRepDelegate.findUnique) {
+        repRecord = await tenantRepDelegate.findUnique({ where: { id: repId } });
+      }
+
+      if (!repRecord && repPhone && tenantRepDelegate.findFirst) {
+        const digits = String(repPhone).replace(/\D/g, '');
+        const e164 = digits ? `+${digits}` : String(repPhone);
+        repRecord = await tenantRepDelegate.findFirst({
+          where: {
+            tenantId,
+            whatsappPhone: { in: [e164, digits, String(repPhone)] },
+          },
+        });
+      }
+
+      let ownerId = fallbackHubspotOwnerId ?? null;
+      if (!repRecord && !ownerId && this.prisma.workflowStep?.findUnique && jobData?.runId) {
+        const step2 = await this.prisma.workflowStep.findUnique({
+          where: {
+            runId_stepKey: {
+              runId: jobData.runId,
+              stepKey: 'step-2-resolve-hubspot-entities',
+            },
+          },
+        });
+        ownerId = (step2?.outputData as any)?.contactOwnerId ?? null;
+      }
+
+      if (!repRecord && ownerId && tenantRepDelegate.findUnique) {
+        repRecord = await tenantRepDelegate.findUnique({
+          where: {
+            tenantId_hubspotOwnerId: { tenantId, hubspotOwnerId: String(ownerId) },
+          },
+        });
+      }
+
+      if (repRecord) {
+        repId = repRecord.id;
+        repPhone = repPhone ?? repRecord.whatsappPhone ?? null;
+        repEmail = repRecord.email ?? null;
+      }
+    }
+
+    const userDelegate = (this.prisma as any).user ?? (this.prisma.client as any)?.user;
+    if (!userId && repEmail && userDelegate?.findUnique) {
+      const matchedUser = await userDelegate.findUnique({
+        where: { email: repEmail.toLowerCase().trim() },
+      });
+      if (matchedUser?.id) {
+        userId = matchedUser.id;
+      }
+    }
+
+    return { repId, repPhone, repEmail, userId };
+  }
+
+  private async recordAuditLog(
+    params: {
+      tenantId: string;
+      actorUserId: string | null;
+      action: string;
+      targetType: string;
+      targetId: string;
+      meta?: Record<string, any>;
+    },
+    tx?: any,
+  ): Promise<void> {
+    const auditDelegate =
+      tx?.auditLog ??
+      (this.prisma as any).auditLog ??
+      (this.prisma.client as any)?.auditLog;
+
+    if (!auditDelegate?.create) {
+      return;
+    }
+
+    await auditDelegate.create({
+      data: {
+        tenantId: params.tenantId,
+        actorUserId: params.actorUserId,
+        action: params.action,
+        targetType: params.targetType,
+        targetId: params.targetId,
+        meta: (params.meta ?? null) as any,
+      },
     });
   }
 

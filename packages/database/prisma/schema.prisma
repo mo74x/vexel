@@ -15,41 +15,101 @@ enum RunStatus {
   DEAD_LETTER
 }
 
+enum RunOutcome {
+  AUTO_SYNCED
+  APPROVED_AS_IS
+  APPROVED_WITH_OVERRIDE
+  REJECTED
+  EXPIRED
+  UNDONE
+  FAILED
+}
+
 enum StepStatus {
   PENDING
   COMPLETED
   FAILED
 }
 
+enum MembershipRole {
+  ADMIN
+  MANAGER
+  SUPPORT
+}
+
+model User {
+  id          String       @id @default(cuid())
+  email       String       @unique
+  name        String
+  locale      String       @default("en")
+  isOperator  Boolean      @default(false)
+  createdAt   DateTime     @default(now())
+  memberships Membership[]
+  auditLogs   AuditLog[]
+}
+
+model Membership {
+  id       String         @id @default(cuid())
+  userId   String
+  user     User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tenantId String
+  tenant   Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  role     MembershipRole
+
+  @@unique([userId, tenantId])
+  @@index([tenantId])
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  actorUserId String?
+  actorUser   User?    @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+  action      String
+  targetType  String
+  targetId    String
+  meta        Json?
+  createdAt   DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+}
+
 model Tenant {
-  id                    String         @id @default(cuid())
-  name                  String
-  slug                  String         @unique
-  hubspotPortalId       String?        @unique
-  hubspotAccessToken    String?
-  hubspotRefreshToken   String?
-  hubspotTokenExpires   DateTime?
-  fallbackApprovalPhone String?
-  whatsappPhoneId       String?        @unique
-  whatsappAccessToken   String?        // Sealed via EnvelopeCryptoService ('vexel:enc:...')
-  autoSyncThreshold     Int            @default(85) // Confidence % threshold
-  createdAt             DateTime       @default(now())
-  updatedAt             DateTime       @updatedAt
-  workflowRuns          WorkflowRun[]
-  usageLedgers          UsageLedger[]
-  tenantReps            TenantRep[]
+  id                     String         @id @default(cuid())
+  name                   String
+  slug                   String         @unique
+  hubspotPortalId        String?        @unique
+  hubspotAccessToken     String?
+  hubspotRefreshToken    String?
+  hubspotTokenExpires    DateTime?
+  fallbackApprovalPhone  String?
+  whatsappPhoneId        String?        @unique
+  whatsappAccessToken    String?        // Sealed via EnvelopeCryptoService ('vexel:enc:...')
+  autoSyncThreshold      Int            @default(85) // Confidence % threshold
+  manualMinutesPerUpdate Int            @default(5)
+  locale                 String         @default("en")
+  timezone               String         @default("Africa/Cairo")
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
+  workflowRuns           WorkflowRun[]
+  usageLedgers           UsageLedger[]
+  tenantReps             TenantRep[]
+  memberships            Membership[]
+  auditLogs              AuditLog[]
 }
 
 model TenantRep {
-  id             String   @id @default(cuid())
+  id             String        @id @default(cuid())
   tenantId       String
-  tenant         Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  hubspotOwnerId String   // HubSpot v3 Owner ID (e.g., "74829104")
-  email          String   // Lowercase corporate email from /crm/v3/owners
+  tenant         Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  hubspotOwnerId String        // HubSpot v3 Owner ID (e.g., "74829104")
+  email          String        // Lowercase corporate email from /crm/v3/owners
   fullName       String
-  whatsappPhone  String?  // E.164 WhatsApp number (e.g., "+201012345678")
-  isActive       Boolean  @default(true)
-  updatedAt      DateTime @updatedAt
+  whatsappPhone  String?       // E.164 WhatsApp number (e.g., "+201012345678")
+  isActive       Boolean       @default(true)
+  updatedAt      DateTime      @updatedAt
+  decidedRuns    WorkflowRun[]
 
   @@unique([tenantId, hubspotOwnerId])
   @@unique([tenantId, email])
@@ -57,24 +117,33 @@ model TenantRep {
 }
 
 model WorkflowRun {
-  id              String         @id @default(cuid())
-  tenantId        String
-  tenant          Tenant         @relation(fields: [tenantId], references: [id])
-  idempotencyKey  String         @unique // SHA-256 of webhook event
-  workflowName    String         // e.g., "omnichannel-to-hubspot-v1"
-  externalDealId  String?        // HubSpot Deal ID once resolved
-  status          RunStatus      @default(PENDING)
-  inputPayload    Json           // Raw WhatsApp/Voice webhook metadata
-  extractedData   Json?          // Validated Zod CRM transition object
-  confidenceScore Int?
-  currentStepIdx  Int            @default(0)
-  errorMessage    String?
-  startedAt       DateTime       @default(now())
-  completedAt     DateTime?
-  steps           WorkflowStep[]
-  usageEntries    UsageLedger[]
+  id               String         @id @default(cuid())
+  tenantId         String
+  tenant           Tenant         @relation(fields: [tenantId], references: [id])
+  idempotencyKey   String         @unique // SHA-256 of webhook event
+  workflowName     String         // e.g., "omnichannel-to-hubspot-v1"
+  externalDealId   String?        // HubSpot Deal ID once resolved
+  status           RunStatus      @default(PENDING)
+  outcome          RunOutcome?
+  inputPayload     Json           // Raw WhatsApp/Voice webhook metadata
+  extractedData    Json?          // Validated Zod CRM transition object
+  overriddenFields Json?
+  confidenceScore  Int?
+  currentStepIdx   Int            @default(0)
+  errorMessage     String?
+  decidedByRepId   String?
+  decidedByRep     TenantRep?     @relation(fields: [decidedByRepId], references: [id], onDelete: SetNull)
+  decidedAt        DateTime?
+  undoneAt         DateTime?
+  createdAt        DateTime       @default(now())
+  startedAt        DateTime       @default(now())
+  completedAt      DateTime?
+  steps            WorkflowStep[]
+  usageEntries     UsageLedger[]
 
   @@index([tenantId, status])
+  @@index([tenantId, createdAt])
+  @@index([tenantId, outcome])
   @@index([externalDealId])
 }
 

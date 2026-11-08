@@ -46,7 +46,7 @@ coverage/
 .idea/
 *.swp
 *.swo
-
+AGENTS.md
 # OS generated files
 .DS_Store
 Thumbs.db

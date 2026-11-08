@@ -27,11 +27,32 @@ export class CrossTenantAccessError extends Error {
   }
 }
 
+export class AppendOnlyModelError extends Error {
+  constructor(model: string, operation: string) {
+    super(
+      `[AUDIT_LOG_IMMUTABLE] Blocked ${model}.${operation}: Model "${model}" is append-only and cannot be updated or deleted.`,
+    );
+    this.name = 'AppendOnlyModelError';
+  }
+}
+
 const TENANT_SCOPED_MODELS = new Set([
   'TenantRep',
   'WorkflowRun',
   'WorkflowStep',
   'UsageLedger',
+  'Membership',
+  'AuditLog',
+]);
+
+const APPEND_ONLY_MODELS = new Set(['AuditLog']);
+
+const APPEND_ONLY_FORBIDDEN_OPERATIONS = new Set([
+  'update',
+  'updateMany',
+  'delete',
+  'deleteMany',
+  'upsert',
 ]);
 
 const WRITE_OPERATIONS = new Set([
@@ -212,6 +233,14 @@ export function createVexelSecurityExtension(basePrisma: PrismaClient) {
         $allModels: {
           async $allOperations({ model, operation, args }) {
             const safeArgs = (args ?? {}) as Record<string, any>;
+
+            // 0. Enforce append-only semantics on immutable models (e.g., AuditLog)
+            if (
+              APPEND_ONLY_MODELS.has(model) &&
+              APPEND_ONLY_FORBIDDEN_OPERATIONS.has(operation)
+            ) {
+              throw new AppendOnlyModelError(model, operation);
+            }
 
             // 1. Enforce AES-256-GCM envelope format on all Tenant OAuth token writes
             if (WRITE_OPERATIONS.has(operation)) {

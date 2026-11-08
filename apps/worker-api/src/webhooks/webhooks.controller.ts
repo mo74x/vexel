@@ -118,6 +118,7 @@ export class WebhooksController {
           tenantId: verified.tenantId,
           runId: verified.runId,
           approved: verified.action === 'approve',
+          ...(rawMsg?.from ? { repPhone: rawMsg.from } : {}),
         });
       }
     }
@@ -321,7 +322,16 @@ export class WebhooksController {
   @HttpCode(200)
   async handleRepApproval(
     @Headers('x-vexel-api-key') apiKey: string | undefined,
-    @Body() body: { runId: string; tenantId: string; approved: boolean; editedPatch?: Record<string, any> },
+    @Body()
+    body: {
+      runId: string;
+      tenantId: string;
+      approved: boolean;
+      editedPatch?: Record<string, any>;
+      decidedByRepId?: string;
+      actorUserId?: string;
+      repPhone?: string;
+    },
   ) {
     this.verifyInternalApiKey(apiKey);
     return this.enqueueRepApproval(body);
@@ -332,20 +342,28 @@ export class WebhooksController {
     tenantId: string;
     approved: boolean;
     editedPatch?: Record<string, any>;
+    decidedByRepId?: string;
+    actorUserId?: string;
+    repPhone?: string;
   }) {
     if (!body.runId || !body.tenantId) {
       throw new BadRequestException('Missing runId or tenantId');
     }
 
+    const jobPayload: Record<string, any> = {
+      tenantId: body.tenantId,
+      runId: body.runId,
+      mode: 'RESUME_AFTER_APPROVAL',
+      approved: body.approved,
+      editedPatch: body.editedPatch,
+    };
+    if (body.repPhone !== undefined) jobPayload.repPhone = body.repPhone;
+    if (body.decidedByRepId !== undefined) jobPayload.decidedByRepId = body.decidedByRepId;
+    if (body.actorUserId !== undefined) jobPayload.actorUserId = body.actorUserId;
+
     await this.workflowQueue.add(
       'execute-revops-pipeline',
-      {
-        tenantId: body.tenantId,
-        runId: body.runId,
-        mode: 'RESUME_AFTER_APPROVAL',
-        approved: body.approved,
-        editedPatch: body.editedPatch,
-      },
+      jobPayload,
       {
         jobId: `resume:${body.runId}`,
         attempts: 5,

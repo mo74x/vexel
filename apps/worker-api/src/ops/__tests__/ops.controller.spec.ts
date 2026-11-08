@@ -1,4 +1,4 @@
-import { RunStatus } from '@prisma/client';
+import { RunOutcome, RunStatus } from '@prisma/client';
 import { OpsController } from '../ops.controller';
 import { validateRuntimeEnv } from '../../config/env-validator';
 
@@ -8,11 +8,15 @@ describe('OpsController & Runtime Env Validator', () => {
   let mockQueue: any;
   let queuedJobs: any[];
   let runStore: Map<string, any>;
+  let updateManyCalls: any[];
+  let auditLogs: any[];
   let controller: OpsController;
 
   beforeEach(() => {
     process.env.VEXEL_INTERNAL_API_KEY = 'ops_admin_secret_123';
     queuedJobs = [];
+    updateManyCalls = [];
+    auditLogs = [];
     runStore = new Map<string, any>([
       [
         'run_dead_1',
@@ -20,6 +24,7 @@ describe('OpsController & Runtime Env Validator', () => {
           id: 'run_dead_1',
           tenantId: 'tenant_acme',
           status: RunStatus.DEAD_LETTER,
+          outcome: RunOutcome.FAILED,
           inputPayload: { senderPhone: '+201001112222', messages: [] },
           errorMessage: 'HubSpot OAuth permanently revoked',
           startedAt: new Date(Date.now() - 3600_000),
@@ -31,6 +36,12 @@ describe('OpsController & Runtime Env Validator', () => {
       client: {
         $queryRawUnsafe: async () => [{ '?column?': 1 }],
       },
+      auditLog: {
+        create: async ({ data }: any) => {
+          auditLogs.push(data);
+          return { id: `aud_${auditLogs.length}`, ...data };
+        },
+      },
       workflowRun: {
         findMany: async () => Array.from(runStore.values()),
         findUnique: async ({ where }: any) => runStore.get(where.id) ?? null,
@@ -40,7 +51,10 @@ describe('OpsController & Runtime Env Validator', () => {
           runStore.set(where.id, updated);
           return updated;
         },
-        updateMany: async () => ({ count: 2 }),
+        updateMany: async (args: any) => {
+          updateManyCalls.push(args);
+          return { count: 2 };
+        },
       },
     };
 
@@ -110,19 +124,36 @@ describe('OpsController & Runtime Env Validator', () => {
       'ops_admin_secret_123',
       'tenant_acme',
       'run_dead_1',
+      { actorUserId: 'user_op_1' },
     );
     expect(replayed.status).toBe('dlq_run_requeued');
     expect(runStore.get('run_dead_1')?.status).toBe(RunStatus.RUNNING);
+    expect(runStore.get('run_dead_1')?.outcome).toBeNull();
     expect(queuedJobs.length).toBe(1);
+    expect(auditLogs[0].tenantId).toBe('tenant_acme');
+    expect(auditLogs[0].actorUserId).toBe('user_op_1');
+    expect(auditLogs[0].action).toBe('workflow_run.dlq_replayed');
+    expect(auditLogs[0].targetType).toBe('WorkflowRun');
+    expect(auditLogs[0].targetId).toBe('run_dead_1');
 
     const discarded = await controller.discardDeadLetterRun(
       'ops_admin_secret_123',
       'tenant_acme',
       'run_dead_1',
-      { reason: 'Duplicate test run' },
+      { reason: 'Duplicate test run', actorUserId: 'user_op_1' },
     );
     expect(discarded.status).toBe('dlq_run_discarded');
     expect(runStore.get('run_dead_1')?.status).toBe(RunStatus.COMPLETED);
+    expect(runStore.get('run_dead_1')?.outcome).toBe(RunOutcome.FAILED);
+    expect(auditLogs[1].tenantId).toBe('tenant_acme');
+    expect(auditLogs[1].actorUserId).toBe('user_op_1');
+    expect(auditLogs[1].action).toBe('workflow_run.dlq_discarded');
+    expect(auditLogs[1].targetType).toBe('WorkflowRun');
+    expect(auditLogs[1].targetId).toBe('run_dead_1');
+    expect(auditLogs[1].meta).toEqual({
+      outcome: RunOutcome.FAILED,
+      reason: 'Duplicate test run',
+    });
 
     const swept = await controller.sweepStaleApprovalsAndRetention(
       'ops_admin_secret_123',
@@ -135,6 +166,8 @@ describe('OpsController & Runtime Env Validator', () => {
       expiredWaitingApprovalsCount: 2,
       scrubbedPiiRunsCount: 2,
     });
+    expect(updateManyCalls[0]?.data.status).toBe(RunStatus.FAILED);
+    expect(updateManyCalls[0]?.data.outcome).toBe(RunOutcome.EXPIRED);
   });
 });
 

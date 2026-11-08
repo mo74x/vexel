@@ -13,7 +13,7 @@ import {
 } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
-import { RunStatus } from '@prisma/client';
+import { RunOutcome, RunStatus } from '@prisma/client';
 import { PrismaService, TenantContext } from '@vexel/database';
 import { VexelLockService } from '../redis/vexel-lock.service';
 
@@ -135,6 +135,7 @@ export class OpsController {
     @Headers('x-vexel-api-key') apiKey: string | undefined,
     @Param('tenantId') tenantId: string,
     @Param('runId') runId: string,
+    @Body() body?: { actorUserId?: string },
   ) {
     this.verifyAdminApiKey(apiKey);
 
@@ -154,18 +155,35 @@ export class OpsController {
       );
     }
 
-    await TenantContext.run(tenantId, () =>
-      this.prisma.workflowRun.update({
+    const senderPhone = (existing.inputPayload as any)?.senderPhone;
+    const replayJobId = `dlq-replay:${runId}:${Date.now()}`;
+
+    await TenantContext.run(tenantId, async () => {
+      await this.prisma.workflowRun.update({
         where: { id: runId },
         data: {
           status: RunStatus.RUNNING,
+          outcome: null,
           errorMessage: null,
         },
-      }),
-    );
+      });
 
-    const senderPhone = (existing.inputPayload as any)?.senderPhone;
-    const replayJobId = `dlq-replay:${runId}:${Date.now()}`;
+      if ((this.prisma as any).auditLog?.create) {
+        await (this.prisma as any).auditLog.create({
+          data: {
+            tenantId,
+            actorUserId: body?.actorUserId ?? null,
+            action: 'workflow_run.dlq_replayed',
+            targetType: 'WorkflowRun',
+            targetId: runId,
+            meta: {
+              previousStatus: existing.status,
+              jobId: replayJobId,
+            },
+          },
+        });
+      }
+    });
 
     await this.workflowQueue.add(
       'execute-revops-pipeline',
@@ -201,20 +219,39 @@ export class OpsController {
     @Headers('x-vexel-api-key') apiKey: string | undefined,
     @Param('tenantId') tenantId: string,
     @Param('runId') runId: string,
-    @Body() body?: { reason?: string },
+    @Body() body?: { reason?: string; actorUserId?: string },
   ) {
     this.verifyAdminApiKey(apiKey);
 
-    await TenantContext.run(tenantId, () =>
-      this.prisma.workflowRun.update({
+    const reason = body?.reason ?? 'Closed by operator';
+
+    await TenantContext.run(tenantId, async () => {
+      await this.prisma.workflowRun.update({
         where: { id: runId },
         data: {
           status: RunStatus.COMPLETED,
+          outcome: RunOutcome.FAILED,
           completedAt: new Date(),
-          errorMessage: `[DLQ Discarded] ${body?.reason ?? 'Closed by operator'}`,
+          errorMessage: `[DLQ Discarded] ${reason}`,
         },
-      }),
-    );
+      });
+
+      if ((this.prisma as any).auditLog?.create) {
+        await (this.prisma as any).auditLog.create({
+          data: {
+            tenantId,
+            actorUserId: body?.actorUserId ?? null,
+            action: 'workflow_run.dlq_discarded',
+            targetType: 'WorkflowRun',
+            targetId: runId,
+            meta: {
+              outcome: RunOutcome.FAILED,
+              reason,
+            },
+          },
+        });
+      }
+    });
 
     return {
       status: 'dlq_run_discarded',
@@ -252,6 +289,7 @@ export class OpsController {
         },
         data: {
           status: RunStatus.FAILED,
+          outcome: RunOutcome.EXPIRED,
           completedAt: new Date(),
           errorMessage: `Approval window expired after ${maxApprovalHours}h without rep response`,
         },
