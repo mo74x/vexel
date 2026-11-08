@@ -2,8 +2,10 @@ import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { prisma } from '@vexel/database';
+import { validateRuntimeEnv } from './config/env-validator';
 
 async function bootstrap() {
+  validateRuntimeEnv(process.env);
   const app = await NestFactory.create(AppModule, { rawBody: true });
 
   // Ensures BullMQ workers drain active jobs before OnModuleDestroy closes Prisma & Redis

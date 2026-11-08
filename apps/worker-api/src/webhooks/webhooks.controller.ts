@@ -122,7 +122,35 @@ export class WebhooksController {
       }
     }
 
-    // 1. Normalize incoming WhatsApp / Voice payload
+    // 1. Handle Meta Delivery Status Callbacks (statuses[]) for failed approval cards
+    const statusEvent = body?.entry?.[0]?.changes?.[0]?.value?.statuses?.[0];
+    if (statusEvent && statusEvent.status === 'failed' && statusEvent.id) {
+      const failedPointer = await this.whatsappApproval.resolveRepOverrideTarget(
+        tenantId,
+        statusEvent.recipient_id ?? '',
+        statusEvent.id,
+      );
+      if (failedPointer && this.prisma?.workflowRun?.update) {
+        const errTitle =
+          statusEvent.errors?.[0]?.title ?? 'WhatsApp message delivery failed';
+        await TenantContext.run(tenantId, () =>
+          this.prisma.workflowRun.update({
+            where: { id: failedPointer.runId },
+            data: {
+              errorMessage: `[WhatsApp Delivery Failed] ${errTitle} (wamid: ${statusEvent.id})`,
+            },
+          }),
+        );
+        return {
+          status: 'delivery_failure_recorded',
+          runId: failedPointer.runId,
+          wamid: statusEvent.id,
+        };
+      }
+      return { status: 'delivery_status_ignored', wamid: statusEvent.id };
+    }
+
+    // 1b. Normalize incoming WhatsApp / Voice payload
     const payload = this.normalizePayload(body);
     if (!payload) {
       return { status: 'ignored_non_message_event' };

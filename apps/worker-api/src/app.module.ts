@@ -4,7 +4,11 @@ import { PrismaService } from '@vexel/database';
 import { VexelLockService } from './redis/vexel-lock.service';
 import { WebhooksController } from './webhooks/webhooks.controller';
 import { TenantOnboardingController } from './onboarding/tenant-onboarding.controller';
+import { OpsController } from './ops/ops.controller';
 import { RevOpsWorkflowProcessor } from './workflows/revops.processor';
+
+const processRole = (process.env.VEXEL_PROCESS_ROLE || 'both').toLowerCase();
+const shouldRunWorker = processRole === 'worker' || processRole === 'both';
 
 @Module({
   imports: [
@@ -17,8 +21,12 @@ import { RevOpsWorkflowProcessor } from './workflows/revops.processor';
       name: 'vexel-workflows',
     }),
   ],
-  controllers: [WebhooksController, TenantOnboardingController],
-  providers: [PrismaService, VexelLockService, RevOpsWorkflowProcessor],
+  controllers: [WebhooksController, TenantOnboardingController, OpsController],
+  providers: [
+    PrismaService,
+    VexelLockService,
+    ...(shouldRunWorker ? [RevOpsWorkflowProcessor] : []),
+  ],
 })
 export class AppModule {}
 

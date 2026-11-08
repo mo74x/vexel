@@ -11,6 +11,31 @@ services:
       POSTGRES_DB: vexel_core
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vexel -d vexel_core"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  vexel-pgbouncer:
+    image: edoburu/pgbouncer:1.22.0-p0
+    container_name: vexel-pgbouncer
+    ports:
+      - "6432:6432"
+    environment:
+      DB_HOST: vexel-postgres
+      DB_PORT: 5432
+      DB_USER: vexel
+      DB_PASSWORD: vexel_dev_password
+      DB_NAME: vexel_core
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 1000
+      DEFAULT_POOL_SIZE: 25
+    volumes:
+      - ./packages/database/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+    depends_on:
+      vexel-postgres:
+        condition: service_healthy
 
   vexel-redis:
     image: redis:7-alpine
@@ -20,6 +45,46 @@ services:
     command: redis-server --appendonly yes
     volumes:
       - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  vexel-api:
+    build: .
+    container_name: vexel-api
+    ports:
+      - "3001:3001"
+    env_file:
+      - .env
+    environment:
+      VEXEL_PROCESS_ROLE: api
+      DATABASE_URL: postgresql://vexel:vexel_dev_password@vexel-pgbouncer:6432/vexel_core
+      DIRECT_URL: postgresql://vexel:vexel_dev_password@vexel-postgres:5432/vexel_core
+      REDIS_URL: redis://vexel-redis:6379
+    depends_on:
+      vexel-pgbouncer:
+        condition: service_started
+      vexel-redis:
+        condition: service_healthy
+
+  vexel-worker:
+    build: .
+    container_name: vexel-worker
+    env_file:
+      - .env
+    environment:
+      VEXEL_PROCESS_ROLE: worker
+      PORT: 3002
+      DATABASE_URL: postgresql://vexel:vexel_dev_password@vexel-pgbouncer:6432/vexel_core
+      DIRECT_URL: postgresql://vexel:vexel_dev_password@vexel-postgres:5432/vexel_core
+      REDIS_URL: redis://vexel-redis:6379
+    depends_on:
+      vexel-pgbouncer:
+        condition: service_started
+      vexel-redis:
+        condition: service_healthy
 
 volumes:
   pgdata:

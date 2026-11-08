@@ -6,5 +6,4 @@ export * from './client/hubspot-http.client';
 export * from './owners/owner-resolver.service';
 export * from './resolver/entity-resolver.service';
 export * from './approval/whatsapp-approval.service';
-export * from './sync/hubspot-deal-sync.service';
 export * from './sync/hubspot-v4-sync.service';
