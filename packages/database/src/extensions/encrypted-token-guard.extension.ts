@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client';
 const PROTECTED_TOKEN_FIELDS = [
   'hubspotAccessToken',
   'hubspotRefreshToken',
+  'whatsappAccessToken',
 ] as const;
 
 type ProtectedTokenField = (typeof PROTECTED_TOKEN_FIELDS)[number];

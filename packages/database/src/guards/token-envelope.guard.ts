@@ -18,6 +18,7 @@ export class UnencryptedTokenWriteError extends Error {
 const PROTECTED_TOKEN_FIELDS = new Set([
   'hubspotAccessToken',
   'hubspotRefreshToken',
+  'whatsappAccessToken',
 ]);
 
 // Matches: vexel:enc:v1:<base64url_dek>:<base64url_cipher>
