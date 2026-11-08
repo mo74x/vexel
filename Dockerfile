@@ -26,3 +26,4 @@ HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
   CMD wget --no-verbose --tries=1 --spider http://localhost:3001/healthz || exit 1
 
 CMD ["pnpm", "--filter", "worker-api", "exec", "tsx", "src/main.ts"]
+
