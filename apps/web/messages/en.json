@@ -1,0 +1,331 @@
+{
+  "navigation": {
+    "activity": "Activity",
+    "reps": "Reps",
+    "impact": "Impact",
+    "settings": "Settings",
+    "logout": "Log out",
+    "brandTitle": "Vexel",
+    "brandTagline": "RevOps Engine"
+  },
+  "auth": {
+    "loginTitle": "Sign in to Vexel",
+    "loginSubtitle": "Enter your work email to receive a passwordless magic link",
+    "emailLabel": "Work Email",
+    "emailPlaceholder": "sales.rep@company.com",
+    "sendMagicLink": "Send Magic Link",
+    "sending": "Sending link...",
+    "linkSentTitle": "Check your inbox",
+    "linkSentDesc": "We sent a single-use 15-minute login link to {email}. Click the link in the email to open your dashboard.",
+    "verifyingTitle": "Verifying your link...",
+    "verifyingDesc": "Connecting securely to Vexel RevOps.",
+    "verifySuccessTitle": "Authenticated!",
+    "verifySuccessDesc": "Redirecting to your workspace...",
+    "verifyErrorTitle": "Link expired or invalid",
+    "verifyErrorDesc": "This magic link has already been used or has expired. Please request a new link.",
+    "requestNewLink": "Request New Link"
+  },
+  "common": {
+    "loading": "Loading...",
+    "retry": "Try again",
+    "errorTitle": "Something went wrong",
+    "errorDesc": "An error occurred while loading this section.",
+    "emptyState": "No records found",
+    "theme": "Theme",
+    "themeLight": "Light",
+    "themeDark": "Dark",
+    "themeSystem": "System",
+    "language": "Language",
+    "activeTenant": "Workspace",
+    "role": "Role",
+    "roles": {
+      "ADMIN": "Admin",
+      "MANAGER": "Manager",
+      "SUPPORT": "Support"
+    }
+  },
+  "activity": {
+    "title": "Activity Queue",
+    "subtitle": "Real-time stream of WhatsApp voice updates, extracted deals, and HubSpot syncs.",
+    "emptyTitle": "No activity found",
+    "emptyDesc": "No voice notes match your current filters. Voice updates from sales reps will appear here automatically.",
+    "search": "Search by deal ID or change summary...",
+    "filters": {
+      "status": "Status",
+      "allStatuses": "All Statuses",
+      "outcome": "Outcome",
+      "allOutcomes": "All Outcomes",
+      "rep": "Representative",
+      "allReps": "All Representatives",
+      "dateRange": "Time Range",
+      "allDates": "All Time",
+      "today": "Today",
+      "last7Days": "Last 7 Days",
+      "last30Days": "Last 30 Days",
+      "reset": "Reset Filters"
+    },
+    "columns": {
+      "rep": "Representative",
+      "deal": "Deal",
+      "changes": "Updates",
+      "confidence": "Confidence",
+      "status": "Status",
+      "time": "Time"
+    },
+    "pagination": {
+      "loadMore": "Load More Runs",
+      "loadingMore": "Loading older runs...",
+      "noMore": "All runs loaded",
+      "liveBadge": "Live polling every 15s"
+    },
+    "statusChips": {
+      "PENDING": "Queued",
+      "RUNNING": "Processing",
+      "WAITING_APPROVAL": "Waiting for Rep",
+      "COMPLETED": "Synced",
+      "FAILED": "Action Required",
+      "DEAD_LETTER": "Failed"
+    },
+    "outcomeChips": {
+      "AUTO_SYNCED": "Auto-Synced",
+      "APPROVED_AS_IS": "Approved as Transcribed",
+      "APPROVED_WITH_OVERRIDE": "Approved with Edits",
+      "REJECTED": "Declined by Rep",
+      "EXPIRED": "Expired (24h)",
+      "UNDONE": "Reverted",
+      "FAILED": "Failed"
+    }
+  },
+  "runDetail": {
+    "back": "Back to Activity",
+    "runHeader": "Deal Sync Details",
+    "deal": "HubSpot Deal",
+    "rep": "Sales Representative",
+    "phone": "Sender Phone",
+    "unassigned": "Unassigned",
+    "transcript": {
+      "title": "Voice Note Transcript",
+      "subtitle": "Original bilingual Arabic/English message received via WhatsApp",
+      "empty": "No transcript available for this workflow run.",
+      "highlightHint": "Highlighted terms represent properties extracted by Vexel AI."
+    },
+    "changes": {
+      "title": "What Vexel Changed",
+      "subtitle": "Deal properties synchronized to HubSpot v4",
+      "empty": "No properties modified in this sync.",
+      "property": "Field Name",
+      "before": "Original Value",
+      "after": "Updated Value",
+      "overrideBadge": "Overridden by Rep"
+    },
+    "timeline": {
+      "title": "Execution Timeline",
+      "subtitle": "Sequential processing steps and audit records",
+      "step": "Step",
+      "duration": "Duration",
+      "status": "Status",
+      "empty": "No step telemetry recorded."
+    },
+    "actions": {
+      "openHubSpot": "Open in HubSpot",
+      "approve": "Approve Update",
+      "approving": "Approving...",
+      "reject": "Decline Update",
+      "rejecting": "Declining...",
+      "replay": "Replay Run",
+      "replaying": "Replaying...",
+      "undo": "Undo Sync (15m window)",
+      "undoAvailable": "15-minute undo snapshot is active",
+      "successApproved": "Workflow run approved and synced to HubSpot",
+      "successRejected": "Workflow run declined",
+      "successReplayed": "Workflow run re-enqueued for execution"
+    },
+    "confidence": {
+      "title": "Extraction Confidence",
+      "high": "High confidence (safe for auto-sync)",
+      "medium": "Medium confidence (forwarded to rep for review)",
+      "low": "Low confidence (requires human inspection)"
+    }
+  },
+  "reps": {
+    "title": "Sales Team",
+    "subtitle": "Active sales reps paired with WhatsApp phone numbers and HubSpot owner accounts.",
+    "emptyTitle": "No sales reps linked",
+    "emptyDesc": "Add your first sales rep to begin capturing deals from WhatsApp.",
+    "addRep": "Add Representative",
+    "sendCode": "Send OTP Code"
+  },
+  "impact": {
+    "title": "RevOps Impact",
+    "subtitle": "Telemetry, auto-sync accuracy, and manual hours saved across your sales pipeline.",
+    "dateRange": {
+      "preset7d": "Last 7 Days",
+      "preset30d": "Last 30 Days",
+      "preset90d": "Last 90 Days",
+      "custom": "Custom Range",
+      "from": "From Date",
+      "to": "To Date",
+      "apply": "Apply Filter"
+    },
+    "kpis": {
+      "totalRuns": "Total Runs",
+      "totalRunsDesc": "Voice notes processed in window",
+      "autoSyncRate": "Auto-Sync Rate",
+      "autoSyncRateDesc": "Synced straight through to HubSpot",
+      "approvalRate": "Approval Rate",
+      "approvalRateDesc": "Of notes forwarded for rep review",
+      "editRate": "Override Rate",
+      "editRateDesc": "Of approved notes edited by rep",
+      "timeSaved": "Estimated Time Saved",
+      "timeSavedBadge": "Est.",
+      "timeSavedDesc": "At {minutes}m baseline per manual update",
+      "editInSettings": "Edit baseline in Settings",
+      "costPerRun": "Cost per Run",
+      "costPerRunDesc": "Total meter spend: ${total}"
+    },
+    "chart": {
+      "title": "Daily Run Volume by Outcome",
+      "subtitle": "Daily distribution of voice notes synchronized, reviewed, and declined",
+      "empty": "No activity recorded in the selected date range.",
+      "totalTooltip": "{count} runs total",
+      "legend": {
+        "autoSynced": "Auto-Synced",
+        "approvedAsIs": "Approved as Transcribed",
+        "approvedWithOverride": "Approved with Edits",
+        "rejected": "Declined by Rep",
+        "failed": "Failed"
+      }
+    },
+    "repsTable": {
+      "title": "Team Activity Breakdown",
+      "subtitle": "Voice notes volume, approval behavior, and accuracy per sales representative",
+      "rep": "Representative",
+      "total": "Runs",
+      "autoSynced": "Auto-Synced",
+      "approved": "Approved",
+      "rejected": "Declined",
+      "avgConfidence": "Avg Confidence",
+      "empty": "No sales representative activity found in this period."
+    }
+  },
+  "settings": {
+    "title": "Workspace Settings",
+    "subtitle": "Tenant configuration, locale preferences, and HubSpot integration status.",
+    "hubspotStatus": "HubSpot Integration",
+    "whatsappStatus": "WhatsApp Cloud API",
+    "connected": "Connected",
+    "disconnected": "Disconnected",
+    "manualMinutesLabel": "Manual Minutes Saved per Update",
+    "manualMinutesHelp": "Estimated minutes a sales rep takes to manually log into HubSpot, update deal stages, amounts, and notes. Used to calculate RevOps time savings.",
+    "manualMinutesPlaceholder": "5",
+    "thresholdLabel": "Auto-Sync Confidence Threshold",
+    "thresholdHelp": "Minimum extraction confidence required to sync directly to HubSpot without requiring rep review.",
+    "saveSettings": "Save Configuration",
+    "saving": "Saving...",
+    "saved": "Settings saved successfully",
+    "invalidMinutes": "Must be a number between 1 and 120 minutes."
+  },
+  "onboarding": {
+    "title": "Welcome to Vexel",
+    "subtitle": "Get your RevOps engine running in four simple steps. Turn sales voice notes into validated HubSpot updates.",
+    "resumeNotice": "Resuming where you left off",
+    "back": "Back",
+    "continue": "Continue",
+    "stepIndicator": "Step {current} of {total}",
+    "steps": {
+      "hubspot": {
+        "title": "Connect HubSpot",
+        "desc": "Authorize Vexel to read and update deal pipelines and owners"
+      },
+      "whatsapp": {
+        "title": "Connect WhatsApp",
+        "desc": "Link your WhatsApp Business phone number and Cloud API credentials"
+      },
+      "reps": {
+        "title": "Pair Sales Reps",
+        "desc": "Map sales team members with their WhatsApp phones"
+      },
+      "rules": {
+        "title": "Rules & Activation",
+        "desc": "Configure confidence thresholds and send a test voice note"
+      }
+    },
+    "hubspot": {
+      "cardTitle": "HubSpot CRM Integration",
+      "cardDesc": "Connect your HubSpot portal to allow Vexel to sync deal updates, associate contacts, and assign reps automatically.",
+      "connectedStatus": "HubSpot Connected",
+      "portalId": "Portal ID: {portalId}",
+      "connectButton": "Connect with HubSpot OAuth",
+      "connecting": "Connecting...",
+      "reconnectButton": "Reconnect HubSpot",
+      "ownersSynced": "Owners and deal pipelines synced",
+      "nextStep": "Continue to WhatsApp Setup"
+    },
+    "whatsapp": {
+      "cardTitle": "WhatsApp Cloud API",
+      "cardDesc": "Configure your Meta WhatsApp Business API credentials. Voice notes sent to this number will be processed by Vexel.",
+      "phoneIdLabel": "Phone Number ID",
+      "phoneIdPlaceholder": "e.g. 108923485721903",
+      "phoneIdHelp": "Found in Meta App Dashboard > WhatsApp > API Setup",
+      "tokenLabel": "System User Access Token",
+      "tokenPlaceholder": "EAAG... (token is sealed securely and never displayed)",
+      "tokenHelp": "Requires whatsapp_business_messaging and whatsapp_business_management permissions.",
+      "saveAndVerify": "Save & Verify Connection",
+      "verifying": "Verifying credentials...",
+      "connectedStatus": "WhatsApp Cloud API Connected",
+      "phoneIdBadge": "Phone ID: {phoneId}",
+      "errorTitle": "WhatsApp Verification Failed",
+      "errorDesc": "Unable to verify WhatsApp credentials. Ensure Phone Number ID and System User token are correct.",
+      "retry": "Retry Verification",
+      "nextStep": "Continue to Rep Pairing"
+    },
+    "reps": {
+      "cardTitle": "Sales Representatives",
+      "cardDesc": "Enter WhatsApp phone numbers for your sales reps so Vexel recognizes their incoming voice notes.",
+      "table": {
+        "name": "Representative",
+        "email": "Email",
+        "phone": "WhatsApp Phone (E.164)",
+        "status": "Pairing Status",
+        "actions": "Actions"
+      },
+      "phonePlaceholder": "+201012345678",
+      "savePhone": "Save",
+      "saving": "Saving...",
+      "sendCode": "Send Link Code",
+      "sendingCode": "Sending...",
+      "codeSent": "Link code sent!",
+      "statusLinked": "Linked",
+      "statusUnlinked": "No Phone",
+      "invalidPhone": "Phone must be in E.164 format (e.g. +201012345678)",
+      "emptyReps": "No synced HubSpot owners found yet. Try reconnecting HubSpot or adding a sales rep.",
+      "linkedCount": "{linked} of {total} reps linked with WhatsApp",
+      "minRepsNotice": "Pair at least 1 sales representative to proceed.",
+      "nextStep": "Continue to Rules & Activation"
+    },
+    "rules": {
+      "cardTitle": "Confidence Rules & First Test",
+      "cardDesc": "Set your auto-sync confidence threshold and send a test voice note to verify live synchronization.",
+      "sliderLabel": "Auto-Sync Confidence Threshold: {value}%",
+      "conservativeExplanation": "Conservative (90%+): Only voice notes with near-certain clarity and complete deal details will update HubSpot automatically. Other notes prompt reps on WhatsApp for quick confirmation.",
+      "balancedExplanation": "Balanced (Recommended, 80-89%): Voice notes with clear deal stage, amount, or close date sync directly to HubSpot. Ambiguous or low-confidence notes route to reps for one-tap WhatsApp approval.",
+      "autonomousExplanation": "Autonomous (<80%): Most voice notes update HubSpot directly with minimal confirmation prompts. Recommended for experienced teams.",
+      "fallbackPhoneLabel": "Fallback Approval Manager Phone",
+      "fallbackPhonePlaceholder": "+201012345678",
+      "fallbackPhoneHelp": "Sales manager phone that receives review requests if a rep cannot be reached.",
+      "invalidFallbackPhone": "Fallback phone must be in E.164 format (e.g. +201012345678)",
+      "saveSettings": "Save Rules",
+      "savingSettings": "Saving...",
+      "settingsSaved": "Rules saved successfully",
+      "testPromptTitle": "Send Your First Voice Note",
+      "testPromptDesc": "Open WhatsApp on your phone and send a voice note to your connected Vexel number. For example:",
+      "sampleQuote": "“Met with Alpha Corp today, deal value is 50k, moving to Decision Maker Bought-In.”",
+      "listeningBadge": "Listening for incoming test voice note...",
+      "listeningHelp": "Vexel will automatically detect your first voice note, transcribe it, and synchronize it to HubSpot.",
+      "celebrationTitle": "🎉 Workspace Successfully Activated!",
+      "celebrationDesc": "Your first voice note was received and synced to HubSpot. Your sales team can now update deals effortlessly via WhatsApp voice notes.",
+      "firstRunAt": "First run recorded at {time}",
+      "goToActivity": "Go to Activity Queue"
+    }
+  }
+}
