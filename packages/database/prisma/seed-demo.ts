@@ -480,7 +480,7 @@ export async function seedDemoTenant() {
       data: {
         tenantId,
         runId: run.id,
-        provider: 'gemini-2.0-flash',
+        provider: `anthropic:${process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514'}`,
         promptTokens: 850,
         completionTokens: 240,
         audioSeconds: 18,

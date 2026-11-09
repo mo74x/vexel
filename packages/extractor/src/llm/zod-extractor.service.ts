@@ -21,15 +21,20 @@ export interface ResolvedCrmContext {
     pipelineId?: string;
 }
 
+export const DEFAULT_ANTHROPIC_MODEL = 'claude-sonnet-4-20250514';
+
 export class ZodExtractorService {
     private readonly anthropic: Anthropic;
+    private readonly model: string;
     private readonly MAX_REPAIR_ATTEMPTS = 2; // 1 initial call + up to 2 self-healing turns
 
     constructor(
         private readonly usageMeter: UsageMeterService,
         private readonly stageCache: PipelineStageCacheService,
+        model?: string,
     ) {
         this.anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+        this.model = model || process.env.ANTHROPIC_MODEL || DEFAULT_ANTHROPIC_MODEL;
     }
 
     async extractTransition(
@@ -86,7 +91,7 @@ ${bundle.mergedTranscript}`,
 
         for (let attempt = 0; attempt <= this.MAX_REPAIR_ATTEMPTS; attempt++) {
             const response = await this.anthropic.messages.create({
-                model: 'claude-3-7-sonnet-20250219',
+                model: this.model,
                 max_tokens: 1200,
                 system: systemPrompt,
                 messages,
@@ -106,8 +111,8 @@ ${bundle.mergedTranscript}`,
                 runId,
                 provider:
                     attempt === 0
-                        ? 'anthropic-claude-3-7-sonnet'
-                        : `anthropic-claude-3-7-sonnet:repair-${attempt}`,
+                        ? `anthropic:${this.model}`
+                        : `anthropic:${this.model}:repair-${attempt}`,
                 promptTokens: response.usage.input_tokens,
                 completionTokens: response.usage.output_tokens,
             });

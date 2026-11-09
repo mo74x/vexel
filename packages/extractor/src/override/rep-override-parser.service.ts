@@ -5,6 +5,7 @@ import {
 } from '../schemas/crm-transition.schema';
 import { TenantDealStage } from '../cache/pipeline-stage-cache.service';
 import { sanitizeRawToolInput } from '../llm/payload-normalizer';
+import { DEFAULT_ANTHROPIC_MODEL } from '../llm/zod-extractor.service';
 import { UsageMeterService } from '../meter/usage-meter.service';
 
 export interface ParsedOverrideResult {
@@ -16,9 +17,11 @@ export interface ParsedOverrideResult {
 
 export class RepOverrideParserService {
   private readonly anthropic: Anthropic;
+  private readonly model: string;
 
-  constructor(private readonly usageMeter: UsageMeterService) {
+  constructor(private readonly usageMeter: UsageMeterService, model?: string) {
     this.anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    this.model = model || process.env.ANTHROPIC_MODEL || DEFAULT_ANTHROPIC_MODEL;
   }
 
   async parseRepTextOverride(params: {
@@ -196,7 +199,7 @@ export class RepOverrideParserService {
       .join('\n');
 
     const response = await this.anthropic.messages.create({
-      model: 'claude-3-7-sonnet-20250219',
+      model: this.model,
       max_tokens: 600,
       system: `You are Vexel's CRM Override Parser. A sales rep is replying on WhatsApp to patch a pending HubSpot update.
 Reference UTC Time: ${referenceNow.toISOString()}.
@@ -244,7 +247,7 @@ SALES REP WHATSAPP OVERRIDE INSTRUCTION:
     await this.usageMeter.recordLlmUsage({
       tenantId,
       runId,
-      provider: 'anthropic-claude-3-7-sonnet:rep-override',
+      provider: `anthropic:${this.model}:rep-override`,
       promptTokens: response.usage.input_tokens,
       completionTokens: response.usage.output_tokens,
     });

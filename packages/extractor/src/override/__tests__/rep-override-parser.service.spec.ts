@@ -164,7 +164,7 @@ describe('RepOverrideParserService (Tier-1 Regex & Tier-2 Bilingual LLM)', () =>
     expect(meteredCalls[0]).toEqual({
       tenantId: 'tenant_1',
       runId: 'run_1',
-      provider: 'anthropic-claude-3-7-sonnet:rep-override',
+      provider: 'anthropic:claude-sonnet-4-20250514:rep-override',
       promptTokens: 310,
       completionTokens: 65,
     });

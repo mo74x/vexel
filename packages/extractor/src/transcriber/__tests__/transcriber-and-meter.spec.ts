@@ -24,7 +24,7 @@ describe('UsageMeterService & BilingualTranscriberService', () => {
     await meter.recordLlmUsage({
       tenantId: 'tenant_1',
       runId: 'run_1',
-      provider: 'anthropic-claude-3-7-sonnet',
+      provider: 'anthropic:claude-sonnet-4-20250514',
       promptTokens: 1000,
       completionTokens: 500,
     });
@@ -32,7 +32,7 @@ describe('UsageMeterService & BilingualTranscriberService', () => {
     await meter.recordAudioUsage({
       tenantId: 'tenant_1',
       runId: 'run_1',
-      provider: 'openai-whisper-v3-verbose',
+      provider: 'openai:whisper-1',
       audioSeconds: 45.2,
     });
 

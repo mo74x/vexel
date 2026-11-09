@@ -689,4 +689,41 @@ describe('Tenant-Scoped Dashboard API (/v1/app)', () => {
       expect(spec.paths['/settings']).toBeDefined();
     });
   });
+
+  describe('Cross-Tenant Attack Surface & Mutation Isolation (Checklist Sections 1, 3 & 5)', () => {
+    const alphaAdminReq = {
+      activeTenant: { id: 'tenant_alpha' },
+      activeRole: MembershipRole.ADMIN,
+      user: { id: 'usr_admin_alpha' },
+    };
+
+    it('blocks cross-tenant run mutations (approve, reject, replay) on another tenant run', async () => {
+      await expect(
+        runsController.approveRun(alphaAdminReq, 'run_104_other_tenant'),
+      ).rejects.toThrow(NotFoundException);
+
+      await expect(
+        runsController.rejectRun(alphaAdminReq, 'run_104_other_tenant', { reason: 'Spoofed' }),
+      ).rejects.toThrow(NotFoundException);
+
+      await expect(
+        runsController.replayRun(alphaAdminReq, 'run_104_other_tenant'),
+      ).rejects.toThrow(NotFoundException);
+
+      expect(queuedJobs.length).toBe(0);
+      expect(auditLogs.length).toBe(0);
+    });
+
+    it('blocks cross-tenant rep updates and never leaks another tenant reps or runs in lists', async () => {
+      await expect(
+        repsController.updateRep(alphaAdminReq, 'rep_other_tenant', { isActive: false }),
+      ).rejects.toThrow(NotFoundException);
+
+      const reps = await repsController.listReps(alphaAdminReq);
+      expect(reps.some((r: any) => r.id === 'rep_other_tenant')).toBe(false);
+
+      const runs = await runsController.listRuns(alphaAdminReq);
+      expect(runs.items.some((r: any) => r.id === 'run_104_other_tenant')).toBe(false);
+    });
+  });
 });

@@ -161,6 +161,85 @@ describe('PayloadNormalizer & ZodExtractorService', () => {
     expect(result.dealStage).toBe('contractsent');
     expect(result.amount).toBe(50000);
     expect(meteredCalls.length).toBe(2);
-    expect(meteredCalls[1].provider).toBe('anthropic-claude-3-7-sonnet:repair-1');
+    expect(meteredCalls[0].provider).toBe('anthropic:claude-sonnet-4-20250514');
+    expect(meteredCalls[1].provider).toBe('anthropic:claude-sonnet-4-20250514:repair-1');
+  });
+
+  it('respects configurable ANTHROPIC_MODEL environment variable and constructor override', async () => {
+    process.env.ANTHROPIC_MODEL = 'claude-3-7-sonnet-20250219';
+    const meteredCalls: any[] = [];
+    const mockUsageMeter: any = {
+      recordLlmUsage: async (params: any) => {
+        meteredCalls.push(params);
+      },
+    };
+    const mockStageCache: any = {
+      getTenantStages: async () => SAMPLE_STAGES,
+    };
+
+    const extractor = new ZodExtractorService(mockUsageMeter, mockStageCache);
+    let requestedModel = '';
+    (extractor as any).anthropic = {
+      messages: {
+        create: async (args: any) => {
+          requestedModel = args.model;
+          return {
+            usage: { input_tokens: 300, output_tokens: 110 },
+            content: [
+              {
+                type: 'tool_use',
+                id: 'toolu_custom',
+                name: 'commit_crm_state_transition',
+                input: {
+                  dealName: 'Acme Deal',
+                  dealStage: 'contractsent',
+                  amount: 50000,
+                  currency: 'USD',
+                  expectedCloseDateIso: '2026-12-01',
+                  summaryNote: 'Customer requested contract.',
+                  meddic: {
+                    metrics: null,
+                    economicBuyer: 'Layla',
+                    decisionCriteria: null,
+                    decisionProcess: null,
+                    identifiedPain: 'Manual CRM entry',
+                    champion: 'Omar',
+                  },
+                  nextTask: null,
+                  detectedLanguage: 'en',
+                  confidenceScore: 95,
+                  confidenceReasoning: 'Explicit contract request.',
+                },
+              },
+            ],
+          };
+        },
+      },
+    };
+
+    await extractor.extractTransition(
+      'tenant_acme',
+      'run_56',
+      'hs_token',
+      {
+        senderPhone: '+201001234567',
+        messageCount: 1,
+        totalAudioSeconds: 10,
+        mergedTranscript: '[10:00:00 TEXT]: Send contract for $50k.',
+      },
+      {
+        contactId: 'c_1',
+        contactName: 'Omar',
+        companyName: 'Acme',
+        activeDealId: 'd_1',
+        currentDealName: 'Acme Deal',
+        currentDealStage: 'appointmentscheduled',
+        currentAmount: 40000,
+      },
+    );
+
+    expect(requestedModel).toBe('claude-3-7-sonnet-20250219');
+    expect(meteredCalls[0].provider).toBe('anthropic:claude-3-7-sonnet-20250219');
+    delete process.env.ANTHROPIC_MODEL;
   });
 });

@@ -48,7 +48,7 @@ flowchart TB
   subgraph Ingestion["Ingestion & Control Plane (apps/worker-api)"]
     direction TB
     WC["WebhooksController<br/>HMAC-SHA256 Signature Verification & Ingestion"]
-    AUTH["AppAuthController<br/>Magic-Link Auth & JWT Bearer Session Validation"]
+    AUTH["AppAuthController<br/>Magic-Link Auth & HttpOnly Cookie Session Validation"]
     APP["AppPortalControllers<br/>/runs, /reps, /metrics, /onboarding, /settings"]
     OPS["OpsController<br/>/healthz, /readyz, DLQ Replay & Sweeper"]
   end
@@ -64,7 +64,7 @@ flowchart TB
     PROC["RevOpsWorkflowProcessor<br/>(BullMQ Worker + 15s Heartbeat Lock)"]
     ANVIL["AnvilStepContext<br/>Deterministic Step Replay & Self-Healing Cache"]
     TRANS["BilingualTranscriberService<br/>OpenAI Whisper Verbose Transcriptions & Merging"]
-    EXT["ZodExtractorService<br/>Claude 3.7 Sonnet Tool-Use + 2-Turn Self-Healing"]
+    EXT["ZodExtractorService<br/>Claude Sonnet 4 Tool-Use + 2-Turn Self-Healing"]
     OVR["RepOverrideParserService<br/>Zero-Latency Regex Parser + LLM Fallback"]
     SYNC["HubSpotV4SyncService<br/>Idempotent v4 Upserts, Associations & OCC Watermarking"]
   end
@@ -78,7 +78,7 @@ flowchart TB
 
   subgraph Providers["External Cloud Services"]
     HS["HubSpot CRM v3/v4<br/>Deals, Contacts, Notes, Tasks, Pipelines, Owners"]
-    AI["OpenAI Whisper & Anthropic Claude 3.7"]
+    AI["OpenAI Whisper & Anthropic Claude Sonnet 4"]
   end
 
   WA -->|"POST /v1/webhooks/:tenantId/ingest"| WC
@@ -117,7 +117,7 @@ sequenceDiagram
   participant Redis as Redis 7 (Debounce & State)
   participant Worker as RevOpsWorkflowProcessor
   participant Anvil as AnvilStepContext (PostgreSQL)
-  participant LLM as Whisper / Claude 3.7
+  participant LLM as Whisper / Claude Sonnet 4
   participant HubSpot as HubSpot CRM v4 API
   actor Admin as Sales Manager / Admin (Web Portal)
 
@@ -327,7 +327,7 @@ erDiagram
     string id PK "cuid()"
     string tenantId FK "RLS Partition Key"
     string runId FK "References WorkflowRun.id"
-    string provider "gemini-2.0-flash | whisper-1 | claude-3-7-sonnet"
+    string provider "openai:whisper-1 | anthropic:claude-sonnet-4-20250514"
     int promptTokens "Input token count"
     int completionTokens "Output token count"
     int audioSeconds "Transcribed audio duration"
@@ -377,7 +377,7 @@ Vexel is structured as a `pnpm` monorepo:
 | **`worker-api`** | `apps/worker-api` | NestJS 11, BullMQ 5, TypeScript, Swagger / OpenAPI 3.1 | Dual-role ingestion API and durable execution worker. Houses omnichannel webhook handlers, OAuth consent endpoints, app portal endpoints (`/v1/app/*`), and the RevOps BullMQ workflow processor. |
 | **`@vexel/anvil-engine`** | `packages/anvil-engine` | TypeScript | Deterministic step execution engine (`AnvilStepContext`). Executes external HTTP I/O strictly outside database transactions, caches intermediate outputs in `WorkflowStep`, and manages cache invalidation. |
 | **`@vexel/crm-hubspot`** | `packages/crm-hubspot` | TypeScript | Encrypted OAuth token manager (`EnvelopeCryptoService`), single-flight token refresher, rate-limit-aware HTTP client with 429 backoff, entity resolver, owner router, WhatsApp approval cards, and idempotent v4 sync + Two-Phase OCC rollback saga. |
-| **`@vexel/extractor`** | `packages/extractor` | TypeScript, Zod | Bilingual Whisper audio transcriber, dynamic HubSpot pipeline stage cache, strict Zod schema generator, self-healing Claude 3.7 Sonnet extractor with 2-turn diagnostic repair, and zero-token regex override parser. |
+| **`@vexel/extractor`** | `packages/extractor` | TypeScript, Zod | Bilingual Whisper audio transcriber (`OPENAI_AUDIO_MODEL`), dynamic HubSpot pipeline stage cache, strict Zod schema generator, self-healing Claude Sonnet 4 extractor (`ANTHROPIC_MODEL`) with 2-turn diagnostic repair, and zero-token regex override parser. |
 | **`@vexel/database`** | `packages/database` | Prisma 7, PostgreSQL 16, PgBouncer | PostgreSQL database schema, migrations, `FORCE ROW LEVEL SECURITY` policies, `AsyncLocalStorage` tenant context (`TenantContext`), transaction-pinned `$withTenantTransaction`, and plaintext token write guards. |
 
 ---
@@ -390,7 +390,7 @@ Every inbound voice note or WhatsApp batch is executed through a sequence of dur
 | :--- | :--- | :--- | :--- |
 | `step-1-transcribe-window` | `inputPayload.messages` | Meta Media API + Whisper verbose JSON | Retries via BullMQ exponential backoff. Merges multiple voice notes and text fragments chronologically; logs audio seconds to `UsageLedger`. |
 | `step-2-resolve-hubspot-entities` | `senderPhone` | HubSpot `/crm/v3/objects/contacts/search` + v4 Deal associations | Locates Contact by E.164 phone and finds active associated Deal. Falls back to Deal owner over Contact owner. |
-| `step-3-extract-zod-schema` | Transcript + `ResolvedHubSpotContext` + `TenantDealStage[]` | Anthropic Claude (`claude-3-7-sonnet-20250219`) tool-use | Stage 1 deterministic sanitizer + Stage 2 two-turn Zod diagnostic feedback loop. Validates MEDDIC qualifiers, deal stage transitions, amounts, and follow-ups. |
+| `step-3-extract-zod-schema` | Transcript + `ResolvedHubSpotContext` + `TenantDealStage[]` | Anthropic Claude (`ANTHROPIC_MODEL`, default `claude-sonnet-4-20250514`) tool-use | Stage 1 deterministic sanitizer + Stage 2 two-turn Zod diagnostic feedback loop. Validates MEDDIC qualifiers, deal stage transitions, amounts, and follow-ups. |
 | `step-4-dispatch-approval-prompt` | `CrmTransitionPayload` (when `confidenceScore <= threshold`) | Meta Graph API `/messages` (Interactive Button Card) | Dispatches interactive card to Deal owner's WhatsApp or `tenant.fallbackApprovalPhone`. Pauses run in `WAITING_APPROVAL`. |
 | `step-4b-apply-rep-override` | `rawRepOverrideText` + existing `CrmTransitionPayload` | Regex parser (<1ms) or Claude fallback | Normalizes Egyptian and Gulf Arabic numbers, shorthand multipliers (`42k`, `1.5m`), currencies, and fuzzy pipeline stages. |
 | `step-5-sync-hubspot-v4` | Final `CrmTransitionPayload` + `ResolvedHubSpotContext` | HubSpot v3/v4 Deals, Notes, Tasks, Associations | Deduplicates Notes and Tasks via deterministic `[vexel_run_id:{runId}]` tags. Handles stale deal stages by invalidating stage caches and evicting Steps 3–5. Captures post-association watermark. |
@@ -414,7 +414,8 @@ Every inbound voice note or WhatsApp batch is executed through a sequence of dur
 ### 4.2 Core Views & Capabilities
 
 1. **Magic-Link Authentication (`/auth/login`, `/auth/verify`)**:
-   - Passwordless email login that issues signed single-use verification tokens.
+   - Passwordless email login that issues single-use 15-minute magic links (`vexel:magic:<sha256>`).
+   - Upon verification, the server sets an opaque **`HttpOnly; Path=/; SameSite=Lax; Secure` cookie** (`vexel_session`) backed by SHA-256 hashed session records in Redis (`vexel:sess:<sha256>`). Zero session tokens are stored in `localStorage` or `sessionStorage`.
    - Evaluates user tenant memberships and provisions role-based access (`ADMIN`, `MANAGER`, `SUPPORT`).
 2. **4-Step Resumable Onboarding Wizard (`/onboarding`)**:
    - Automatically queries `GET /v1/app/onboarding/status` to resume exactly where the workspace left off.
@@ -513,13 +514,15 @@ vexel:enc:<kekVersion>:<wrappedDekBundleBase64Url>:<cipherBundleBase64Url>
 | `vexel:pipelines:{tenantId}:{pipelineId}` | `STRING` | `6h` | Cached custom HubSpot deal stages and win probabilities. |
 | `vexel:owners:{tenantId}` | `HASH` | `12h` | Cached mapping of `hubspotOwnerId` to name, email, and WhatsApp phone. |
 | `vexel:rep-link-otp:{tenantId}:{e164Phone}` | `STRING` | `10m` | SHA-256 OTP hash and attempt counter (max 5) for rep self-linking. |
+| `vexel:magic:{sha256}` | `STRING` | `15m` | Single-use SHA-256 hashed magic-link token consumed atomically via `GETDEL`. |
+| `vexel:sess:{sha256}` | `STRING` | `7d` | Server-side session record bound to the `vexel_session` `HttpOnly` cookie (only SHA-256 token hash stored). |
 | `vexel:undo:{tenantId}:{runId}` | `STRING` | `15m` | Stores `HubSpotUndoSnapshot` post-association OCC watermarks; popped via `GETDEL`. |
 
 ---
 
 ## 9. HTTP & Portal API Reference
 
-Vexel exposes a complete OpenAPI 3.1 specification at [`apps/worker-api/src/openapi/vexel-app-api.openapi.json`](file:///c:/Users/3rafa/Desktop/projects/vexel/apps/worker-api/src/openapi/vexel-app-api.openapi.json).
+Vexel exposes a complete OpenAPI 3.1 specification at [`apps/worker-api/src/openapi/vexel-app-api.openapi.json`](./apps/worker-api/src/openapi/vexel-app-api.openapi.json).
 
 ### 9.1 Tenant-Scoped App Portal API (`/v1/app`)
 
@@ -571,7 +574,7 @@ All portal endpoints run behind the session auth guard, injecting the authentica
 
 ## 10. Realistic Demo Seed Dataset (`pnpm db:seed`)
 
-Vexel includes a seed generator ([`packages/database/prisma/seed-demo.ts`](file:///c:/Users/3rafa/Desktop/projects/vexel/packages/database/prisma/seed-demo.ts)) that provisions a demonstration workspace:
+Vexel includes a seed generator ([`packages/database/prisma/seed-demo.ts`](./packages/database/prisma/seed-demo.ts)) that provisions a demonstration workspace:
 
 ```bash
 pnpm db:seed
@@ -609,7 +612,9 @@ Copy `.env.example` to `.env` and configure the following variables:
 | `META_APP_SECRET` | Meta Application Secret for WhatsApp webhook signature validation. |
 | `META_WEBHOOK_VERIFY_TOKEN` | Verification token verified during WhatsApp webhook registration. |
 | `OPENAI_API_KEY` | OpenAI API key for Whisper audio transcription. |
-| `ANTHROPIC_API_KEY` | Anthropic API key for Claude 3.7 Sonnet structured extraction. |
+| `OPENAI_AUDIO_MODEL` | Configurable OpenAI transcription model (default: `whisper-1`). |
+| `ANTHROPIC_API_KEY` | Anthropic API key for Claude structured extraction. |
+| `ANTHROPIC_MODEL` | Configurable Anthropic extraction model (default: `claude-sonnet-4-20250514`). |
 | `NEXT_PUBLIC_API_URL` | Worker API backend URL for `apps/web` (default: `http://localhost:3001`). |
 
 ---
@@ -651,7 +656,7 @@ The Web Portal will be available at `http://localhost:3000` (English at `/en/act
 Vexel maintains strict type safety and high unit test coverage across all packages:
 
 ```bash
-# Run all 28 Vitest unit test suites (136 tests)
+# Run all 28 Vitest unit test suites (139 tests)
 pnpm test
 
 # Run Vitest in interactive watch mode

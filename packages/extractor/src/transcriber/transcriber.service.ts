@@ -17,11 +17,15 @@ export interface MergedTranscriptBundle {
   mergedTranscript: string;
 }
 
+export const DEFAULT_OPENAI_AUDIO_MODEL = 'whisper-1';
+
 export class BilingualTranscriberService {
   private readonly openai: OpenAI;
+  private readonly model: string;
 
-  constructor(private readonly usageMeter: UsageMeterService) {
+  constructor(private readonly usageMeter: UsageMeterService, model?: string) {
     this.openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    this.model = model || process.env.OPENAI_AUDIO_MODEL || DEFAULT_OPENAI_AUDIO_MODEL;
   }
 
   async transcribeAndMergeBatch(
@@ -57,7 +61,7 @@ export class BilingualTranscriberService {
       await this.usageMeter.recordAudioUsage({
         tenantId,
         runId,
-        provider: 'openai-whisper-v3-verbose',
+        provider: `openai:${this.model}`,
         audioSeconds: totalAudioSeconds,
       });
     }
@@ -90,7 +94,7 @@ export class BilingualTranscriberService {
     // verbose_json returns exact audio duration for our UsageLedger
     const transcription = await this.openai.audio.transcriptions.create({
       file: audioFile,
-      model: 'whisper-1',
+      model: this.model,
       response_format: 'verbose_json',
       prompt:
         'B2B sales conversation mixing English and Arabic (Egyptian/Gulf dialects). Preserve English business terms: HubSpot, PO, SLA, contract, retainer, invoice, Q1, Q2, Q3, Q4, USD, EGP, SAR, AED.',
