@@ -28,8 +28,11 @@ describe('Tenant-Scoped Dashboard API (/v1/app)', () => {
     hubspotPortalId: '14429103',
     whatsappAccessToken: 'vexel:enc:v1:wa_alpha',
     whatsappPhoneId: 'wa_phone_alpha',
+    fallbackApprovalPhone: '+201011112222',
     autoSyncThreshold: 85,
     manualMinutesPerUpdate: 6,
+    locale: 'en',
+    timezone: 'Africa/Cairo',
   };
 
   const tenantBeta = {
@@ -40,8 +43,11 @@ describe('Tenant-Scoped Dashboard API (/v1/app)', () => {
     hubspotPortalId: null,
     whatsappAccessToken: null,
     whatsappPhoneId: null,
+    fallbackApprovalPhone: null,
     autoSyncThreshold: 80,
     manualMinutesPerUpdate: 5,
+    locale: 'en',
+    timezone: 'Africa/Cairo',
   };
 
   let mockReps: any[];
@@ -240,6 +246,11 @@ describe('Tenant-Scoped Dashboard API (/v1/app)', () => {
           if (where.id === 'tenant_alpha') return tenantAlpha;
           if (where.id === 'tenant_beta') return tenantBeta;
           return null;
+        },
+        update: async ({ where, data }: any) => {
+          const tenant = where.id === 'tenant_alpha' ? tenantAlpha : tenantBeta;
+          if (tenant) Object.assign(tenant, data);
+          return tenant;
         },
       },
       workflowRun: {
@@ -563,9 +574,26 @@ describe('Tenant-Scoped Dashboard API (/v1/app)', () => {
         NotFoundException,
       );
     });
+
+    it('validates E.164 phone numbers and rejects invalid formats on rep create and update', async () => {
+      await expect(
+        repsController.createRep(adminReq, {
+          hubspotOwnerId: 'owner_201',
+          email: 'invalid@alpha.io',
+          fullName: 'Invalid Rep',
+          whatsappPhone: '01012345678', // missing + and country code
+        }),
+      ).rejects.toThrow(BadRequestException);
+
+      await expect(
+        repsController.updateRep(managerReq, 'rep_sara', {
+          whatsappPhone: 'invalid-phone-string',
+        }),
+      ).rejects.toThrow(BadRequestException);
+    });
   });
 
-  describe('Metrics & Onboarding Status (/metrics, /onboarding/status)', () => {
+  describe('Metrics, Settings & Onboarding Status (/metrics, /settings, /onboarding/status)', () => {
     const req = {
       activeTenant: { id: 'tenant_alpha' },
       activeRole: MembershipRole.MANAGER,
@@ -581,6 +609,11 @@ describe('Tenant-Scoped Dashboard API (/v1/app)', () => {
       expect(metrics.manualMinutesPerUpdate).toBe(6);
       expect(metrics.estimatedMinutesSaved).toBe(6); // 1 synced run * 6 min
       expect(metrics.totalCostUsd).toBe(0.0485);
+      expect(metrics.costPerRun).toBe(0.0162);
+      expect(metrics.dailyBuckets.length > 0).toBe(true);
+      expect(metrics.repsActivity.length).toBe(1);
+      expect(metrics.repsActivity[0].repId).toBe('rep_sara');
+      expect(metrics.repsActivity[0].autoSyncedCount).toBe(1);
     });
 
     it('returns onboarding integration status for the active tenant', async () => {
@@ -592,6 +625,51 @@ describe('Tenant-Scoped Dashboard API (/v1/app)', () => {
       expect(status.repsLinkedCount).toBe(1); // Sara has whatsappPhone, Omar does not
       expect(status.totalRepsCount).toBe(2);
       expect(status.firstRunReceived).toBe(true);
+    });
+
+    it('returns workspace settings without exposing tokens', async () => {
+      const settings = await metricsController.getSettings(req);
+
+      expect(settings.id).toBe('tenant_alpha');
+      expect(settings.hubspotConnected).toBe(true);
+      expect(settings.whatsappConnected).toBe(true);
+      expect(settings.autoSyncThreshold).toBe(85);
+      expect(settings.fallbackApprovalPhone).toBe('+201011112222');
+      expect((settings as any).hubspotAccessToken).toBeUndefined();
+      expect((settings as any).whatsappAccessToken).toBeUndefined();
+      expect((settings as any).rawWhatsAppToken).toBeUndefined();
+    });
+
+    it('updates tenant settings, seals rawWhatsAppToken, and enforces E.164 validation', async () => {
+      const updated = await metricsController.updateSettings(
+        { ...req, user: { id: 'usr_admin_1' } },
+        {
+          autoSyncThreshold: 90,
+          fallbackApprovalPhone: '+201099998888',
+          whatsappPhoneId: 'wa_phone_new',
+          rawWhatsAppToken: 'EAAG_fresh_meta_token_12345',
+        },
+      );
+
+      expect(updated.autoSyncThreshold).toBe(90);
+      expect(updated.fallbackApprovalPhone).toBe('+201099998888');
+      expect(updated.whatsappPhoneId).toBe('wa_phone_new');
+      expect(tenantAlpha.whatsappAccessToken).toContain('vexel:enc:');
+      expect(auditLogs.at(-1)?.action).toBe('settings.updated');
+
+      // Invalid E.164 fallback phone throws
+      await expect(
+        metricsController.updateSettings(req, {
+          fallbackApprovalPhone: '01099998888',
+        }),
+      ).rejects.toThrow(BadRequestException);
+
+      // Invalid threshold throws
+      await expect(
+        metricsController.updateSettings(req, {
+          autoSyncThreshold: 150,
+        }),
+      ).rejects.toThrow(BadRequestException);
     });
   });
 
@@ -608,6 +686,7 @@ describe('Tenant-Scoped Dashboard API (/v1/app)', () => {
       expect(spec.paths['/reps']).toBeDefined();
       expect(spec.paths['/metrics']).toBeDefined();
       expect(spec.paths['/onboarding/status']).toBeDefined();
+      expect(spec.paths['/settings']).toBeDefined();
     });
   });
 });

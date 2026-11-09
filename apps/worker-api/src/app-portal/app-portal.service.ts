@@ -16,6 +16,42 @@ import {
 } from '@vexel/crm-hubspot';
 import { formatPhoneNumberForRole } from './utils/phone-mask.util';
 
+export const E164_PHONE_REGEX = /^\+[1-9]\d{1,14}$/;
+
+export function validateE164Phone(phone: string, fieldName = 'phone'): string {
+  const trimmed = phone.trim();
+  if (!E164_PHONE_REGEX.test(trimmed)) {
+    throw new BadRequestException(
+      `Invalid ${fieldName} "${phone}". Must be a valid E.164 phone number starting with + and country code (e.g. +201012345678).`,
+    );
+  }
+  return trimmed;
+}
+
+export interface TenantSettingsDto {
+  id: string;
+  name: string;
+  slug: string;
+  hubspotPortalId: string | null;
+  hubspotConnected: boolean;
+  whatsappPhoneId: string | null;
+  whatsappConnected: boolean;
+  fallbackApprovalPhone: string | null;
+  autoSyncThreshold: number;
+  manualMinutesPerUpdate: number;
+  locale: string;
+  timezone: string;
+}
+
+export class UpdateTenantSettingsDto {
+  name?: string;
+  autoSyncThreshold?: number;
+  fallbackApprovalPhone?: string | null;
+  whatsappPhoneId?: string | null;
+  rawWhatsAppToken?: string;
+  manualMinutesPerUpdate?: number;
+}
+
 export interface RunListItemDto {
   id: string;
   workflowName: string;
@@ -64,6 +100,28 @@ export interface RunDetailDto extends RunListItemDto {
   }>;
 }
 
+export interface DailyMetricBucketDto {
+  date: string;
+  total: number;
+  autoSynced: number;
+  approvedAsIs: number;
+  approvedWithOverride: number;
+  rejected: number;
+  failed: number;
+}
+
+export interface RepActivitySummaryDto {
+  repId: string;
+  fullName: string;
+  email: string;
+  totalRuns: number;
+  autoSyncedCount: number;
+  approvedCount: number;
+  overrideCount: number;
+  rejectedCount: number;
+  averageConfidence: number | null;
+}
+
 export interface MetricsSummaryDto {
   window: { from: string; to: string };
   totalRuns: number;
@@ -76,6 +134,9 @@ export interface MetricsSummaryDto {
   estimatedMinutesSaved: number;
   manualMinutesPerUpdate: number;
   totalCostUsd: number;
+  costPerRun: number;
+  dailyBuckets: DailyMetricBucketDto[];
+  repsActivity: RepActivitySummaryDto[];
 }
 
 export interface OnboardingStatusDto {
@@ -97,6 +158,7 @@ export interface OnboardingStatusDto {
 @Injectable()
 export class AppPortalService {
   private readonly ownerResolver: HubSpotOwnerResolverService;
+  private readonly tokenManager: HubSpotTokenManagerService;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -105,12 +167,12 @@ export class AppPortalService {
   ) {
     const rawPrisma = (this.prisma as any).client ?? this.prisma;
     const envelopeCrypto = new EnvelopeCryptoService();
-    const tokenManager = new HubSpotTokenManagerService(
+    this.tokenManager = new HubSpotTokenManagerService(
       rawPrisma,
       this.lockService.redis,
       envelopeCrypto,
     );
-    const httpClient = new HubSpotHttpClient(this.lockService.redis, tokenManager);
+    const httpClient = new HubSpotHttpClient(this.lockService.redis, this.tokenManager);
     this.ownerResolver = new HubSpotOwnerResolverService(
       rawPrisma,
       this.lockService.redis,
@@ -476,7 +538,9 @@ export class AppPortalService {
     }
 
     const email = body.email.toLowerCase().trim();
-    const whatsappPhone = body.whatsappPhone ? `+${body.whatsappPhone.replace(/\D/g, '')}` : null;
+    const whatsappPhone = body.whatsappPhone?.trim()
+      ? validateE164Phone(body.whatsappPhone, 'whatsappPhone')
+      : null;
 
     const rep = await this.prisma.tenantRep.create({
       data: {
@@ -530,8 +594,8 @@ export class AppPortalService {
     if (body.fullName !== undefined) data.fullName = body.fullName.trim();
     if (body.email !== undefined) data.email = body.email.toLowerCase().trim();
     if (body.whatsappPhone !== undefined) {
-      data.whatsappPhone = body.whatsappPhone
-        ? `+${body.whatsappPhone.replace(/\D/g, '')}`
+      data.whatsappPhone = body.whatsappPhone?.trim()
+        ? validateE164Phone(body.whatsappPhone, 'whatsappPhone')
         : null;
     }
     if (body.isActive !== undefined) data.isActive = body.isActive;
@@ -627,9 +691,19 @@ export class AppPortalService {
         },
       },
       select: {
+        id: true,
         status: true,
         outcome: true,
         confidenceScore: true,
+        createdAt: true,
+        decidedByRepId: true,
+        decidedByRep: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true,
+          },
+        },
       },
     });
 
@@ -655,6 +729,44 @@ export class AppPortalService {
     let totalConfidence = 0;
     let confidenceCount = 0;
 
+    // Daily buckets map: date string (YYYY-MM-DD) -> bucket
+    const dailyMap = new Map<string, DailyMetricBucketDto>();
+    const curDate = new Date(fromDate);
+    curDate.setUTCHours(0, 0, 0, 0);
+    const endDate = new Date(toDate);
+    endDate.setUTCHours(23, 59, 59, 999);
+
+    while (curDate <= endDate) {
+      const dStr = curDate.toISOString().slice(0, 10);
+      dailyMap.set(dStr, {
+        date: dStr,
+        total: 0,
+        autoSynced: 0,
+        approvedAsIs: 0,
+        approvedWithOverride: 0,
+        rejected: 0,
+        failed: 0,
+      });
+      curDate.setUTCDate(curDate.getUTCDate() + 1);
+    }
+
+    // Reps activity map: repId -> summary
+    const repMap = new Map<
+      string,
+      {
+        repId: string;
+        fullName: string;
+        email: string;
+        totalRuns: number;
+        autoSyncedCount: number;
+        approvedCount: number;
+        overrideCount: number;
+        rejectedCount: number;
+        totalConfidence: number;
+        confidenceCount: number;
+      }
+    >();
+
     for (const run of runs) {
       if (run.outcome && runsByOutcome[run.outcome] !== undefined) {
         runsByOutcome[run.outcome]++;
@@ -666,7 +778,92 @@ export class AppPortalService {
         totalConfidence += run.confidenceScore;
         confidenceCount++;
       }
+
+      // Aggregate into daily buckets
+      const runDateStr = run.createdAt.toISOString().slice(0, 10);
+      let dayBucket = dailyMap.get(runDateStr);
+      if (!dayBucket) {
+        dayBucket = {
+          date: runDateStr,
+          total: 0,
+          autoSynced: 0,
+          approvedAsIs: 0,
+          approvedWithOverride: 0,
+          rejected: 0,
+          failed: 0,
+        };
+        dailyMap.set(runDateStr, dayBucket);
+      }
+      dayBucket.total++;
+      if (run.outcome === RunOutcome.AUTO_SYNCED) {
+        dayBucket.autoSynced++;
+      } else if (run.outcome === RunOutcome.APPROVED_AS_IS) {
+        dayBucket.approvedAsIs++;
+      } else if (run.outcome === RunOutcome.APPROVED_WITH_OVERRIDE) {
+        dayBucket.approvedWithOverride++;
+      } else if (run.outcome === RunOutcome.REJECTED) {
+        dayBucket.rejected++;
+      } else if (run.outcome === RunOutcome.FAILED || run.status === RunStatus.FAILED) {
+        dayBucket.failed++;
+      }
+
+      // Aggregate into reps activity
+      if (run.decidedByRep) {
+        const rep = run.decidedByRep;
+        let repEntry = repMap.get(rep.id);
+        if (!repEntry) {
+          repEntry = {
+            repId: rep.id,
+            fullName: rep.fullName,
+            email: rep.email,
+            totalRuns: 0,
+            autoSyncedCount: 0,
+            approvedCount: 0,
+            overrideCount: 0,
+            rejectedCount: 0,
+            totalConfidence: 0,
+            confidenceCount: 0,
+          };
+          repMap.set(rep.id, repEntry);
+        }
+        repEntry.totalRuns++;
+        if (run.outcome === RunOutcome.AUTO_SYNCED) {
+          repEntry.autoSyncedCount++;
+        } else if (run.outcome === RunOutcome.APPROVED_AS_IS) {
+          repEntry.approvedCount++;
+        } else if (run.outcome === RunOutcome.APPROVED_WITH_OVERRIDE) {
+          repEntry.approvedCount++;
+          repEntry.overrideCount++;
+        } else if (run.outcome === RunOutcome.REJECTED) {
+          repEntry.rejectedCount++;
+        }
+        if (typeof run.confidenceScore === 'number') {
+          repEntry.totalConfidence += run.confidenceScore;
+          repEntry.confidenceCount++;
+        }
+      }
     }
+
+    const dailyBuckets = Array.from(dailyMap.values()).sort((a, b) =>
+      a.date.localeCompare(b.date),
+    );
+
+    const repsActivity: RepActivitySummaryDto[] = Array.from(repMap.values())
+      .map((r) => ({
+        repId: r.repId,
+        fullName: r.fullName,
+        email: r.email,
+        totalRuns: r.totalRuns,
+        autoSyncedCount: r.autoSyncedCount,
+        approvedCount: r.approvedCount,
+        overrideCount: r.overrideCount,
+        rejectedCount: r.rejectedCount,
+        averageConfidence:
+          r.confidenceCount > 0
+            ? Number((r.totalConfidence / r.confidenceCount).toFixed(1))
+            : null,
+      }))
+      .sort((a, b) => b.totalRuns - a.totalRuns);
 
     const totalRuns = runs.length;
     const autoSynced = runsByOutcome[RunOutcome.AUTO_SYNCED];
@@ -701,6 +898,8 @@ export class AppPortalService {
     });
 
     const totalCostUsd = Number(usageAggregate._sum.estimatedCostUsd ?? 0);
+    const costPerRun =
+      totalRuns > 0 ? Number((totalCostUsd / totalRuns).toFixed(4)) : 0;
 
     return {
       window: { from: fromDate.toISOString(), to: toDate.toISOString() },
@@ -714,6 +913,9 @@ export class AppPortalService {
       estimatedMinutesSaved,
       manualMinutesPerUpdate,
       totalCostUsd: Number(totalCostUsd.toFixed(4)),
+      costPerRun,
+      dailyBuckets,
+      repsActivity,
     };
   }
 
@@ -771,6 +973,139 @@ export class AppPortalService {
       autoSyncThreshold: tenant.autoSyncThreshold,
       manualMinutesPerUpdate: tenant.manualMinutesPerUpdate,
     };
+  }
+
+  /**
+   * GET /v1/app/settings
+   * Returns workspace settings for the active tenant (NEVER reveals tokens).
+   */
+  async getTenantSettings(tenantId: string): Promise<TenantSettingsDto> {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: {
+        id: true,
+        name: true,
+        slug: true,
+        hubspotPortalId: true,
+        hubspotAccessToken: true,
+        whatsappPhoneId: true,
+        whatsappAccessToken: true,
+        fallbackApprovalPhone: true,
+        autoSyncThreshold: true,
+        manualMinutesPerUpdate: true,
+        locale: true,
+        timezone: true,
+      },
+    });
+
+    if (!tenant) {
+      throw new NotFoundException(`Tenant "${tenantId}" not found`);
+    }
+
+    return {
+      id: tenant.id,
+      name: tenant.name,
+      slug: tenant.slug,
+      hubspotPortalId: tenant.hubspotPortalId,
+      hubspotConnected: Boolean(tenant.hubspotAccessToken),
+      whatsappPhoneId: tenant.whatsappPhoneId,
+      whatsappConnected: Boolean(tenant.whatsappAccessToken || tenant.whatsappPhoneId),
+      fallbackApprovalPhone: tenant.fallbackApprovalPhone,
+      autoSyncThreshold: tenant.autoSyncThreshold,
+      manualMinutesPerUpdate: tenant.manualMinutesPerUpdate,
+      locale: tenant.locale,
+      timezone: tenant.timezone,
+    };
+  }
+
+  /**
+   * PATCH /v1/app/settings
+   * Updates workspace settings. If rawWhatsAppToken is supplied, it is sealed at rest via EnvelopeCryptoService.
+   */
+  async updateTenantSettings(
+    tenantId: string,
+    actorUserId: string | null,
+    body: UpdateTenantSettingsDto,
+  ): Promise<TenantSettingsDto> {
+    const existing = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+    });
+
+    if (!existing) {
+      throw new NotFoundException(`Tenant "${tenantId}" not found`);
+    }
+
+    const data: Record<string, any> = {};
+
+    if (body.name !== undefined) {
+      data.name = body.name.trim();
+    }
+
+    if (body.autoSyncThreshold !== undefined) {
+      if (
+        typeof body.autoSyncThreshold !== 'number' ||
+        body.autoSyncThreshold < 0 ||
+        body.autoSyncThreshold > 100
+      ) {
+        throw new BadRequestException('autoSyncThreshold must be a number between 0 and 100');
+      }
+      data.autoSyncThreshold = Math.round(body.autoSyncThreshold);
+    }
+
+    if (body.manualMinutesPerUpdate !== undefined) {
+      if (
+        typeof body.manualMinutesPerUpdate !== 'number' ||
+        body.manualMinutesPerUpdate < 1 ||
+        body.manualMinutesPerUpdate > 120
+      ) {
+        throw new BadRequestException('manualMinutesPerUpdate must be a number between 1 and 120');
+      }
+      data.manualMinutesPerUpdate = Math.round(body.manualMinutesPerUpdate);
+    }
+
+    if (body.fallbackApprovalPhone !== undefined) {
+      if (body.fallbackApprovalPhone === null || body.fallbackApprovalPhone.trim() === '') {
+        data.fallbackApprovalPhone = null;
+      } else {
+        data.fallbackApprovalPhone = validateE164Phone(
+          body.fallbackApprovalPhone,
+          'fallbackApprovalPhone',
+        );
+      }
+    }
+
+    if (body.whatsappPhoneId !== undefined) {
+      data.whatsappPhoneId = body.whatsappPhoneId?.trim() ? body.whatsappPhoneId.trim() : null;
+    }
+
+    if (Object.keys(data).length > 0) {
+      await this.prisma.tenant.update({
+        where: { id: tenantId },
+        data,
+      });
+    }
+
+    if (body.rawWhatsAppToken && body.rawWhatsAppToken.trim()) {
+      await this.tokenManager.sealAndStoreTenantWhatsAppToken(
+        tenantId,
+        body.rawWhatsAppToken.trim(),
+      );
+    }
+
+    await this.recordAuditLog({
+      tenantId,
+      actorUserId,
+      action: 'settings.updated',
+      targetType: 'Tenant',
+      targetId: tenantId,
+      meta: {
+        updatedFields: Object.keys(data).concat(
+          body.rawWhatsAppToken ? ['whatsappAccessToken'] : [],
+        ),
+      },
+    });
+
+    return this.getTenantSettings(tenantId);
   }
 
   private formatRunListItem(run: any, role: MembershipRole): RunListItemDto {

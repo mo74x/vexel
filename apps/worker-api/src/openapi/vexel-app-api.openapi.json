@@ -216,7 +216,42 @@
           "averageConfidence": { "type": ["number", "null"] },
           "estimatedMinutesSaved": { "type": "number" },
           "manualMinutesPerUpdate": { "type": "integer" },
-          "totalCostUsd": { "type": "number" }
+          "totalCostUsd": { "type": "number" },
+          "costPerRun": { "type": "number" },
+          "dailyBuckets": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "date": { "type": "string" },
+                "total": { "type": "integer" },
+                "autoSynced": { "type": "integer" },
+                "approvedAsIs": { "type": "integer" },
+                "approvedWithOverride": { "type": "integer" },
+                "rejected": { "type": "integer" },
+                "failed": { "type": "integer" }
+              },
+              "required": ["date", "total", "autoSynced", "approvedAsIs", "approvedWithOverride", "rejected", "failed"]
+            }
+          },
+          "repsActivity": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "repId": { "type": "string" },
+                "fullName": { "type": "string" },
+                "email": { "type": "string" },
+                "totalRuns": { "type": "integer" },
+                "autoSyncedCount": { "type": "integer" },
+                "approvedCount": { "type": "integer" },
+                "overrideCount": { "type": "integer" },
+                "rejectedCount": { "type": "integer" },
+                "averageConfidence": { "type": ["number", "null"] }
+              },
+              "required": ["repId", "fullName", "email", "totalRuns", "autoSyncedCount", "approvedCount", "overrideCount", "rejectedCount"]
+            }
+          }
         },
         "required": [
           "window",
@@ -228,7 +263,10 @@
           "editRate",
           "estimatedMinutesSaved",
           "manualMinutesPerUpdate",
-          "totalCostUsd"
+          "totalCostUsd",
+          "costPerRun",
+          "dailyBuckets",
+          "repsActivity"
         ]
       },
       "OnboardingStatus": {
@@ -260,6 +298,45 @@
           "autoSyncThreshold",
           "manualMinutesPerUpdate"
         ]
+      },
+      "TenantSettings": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "slug": { "type": "string" },
+          "hubspotPortalId": { "type": ["string", "null"] },
+          "hubspotConnected": { "type": "boolean" },
+          "whatsappPhoneId": { "type": ["string", "null"] },
+          "whatsappConnected": { "type": "boolean" },
+          "fallbackApprovalPhone": { "type": ["string", "null"] },
+          "autoSyncThreshold": { "type": "integer" },
+          "manualMinutesPerUpdate": { "type": "integer" },
+          "locale": { "type": "string" },
+          "timezone": { "type": "string" }
+        },
+        "required": [
+          "id",
+          "name",
+          "slug",
+          "hubspotConnected",
+          "whatsappConnected",
+          "autoSyncThreshold",
+          "manualMinutesPerUpdate",
+          "locale",
+          "timezone"
+        ]
+      },
+      "UpdateTenantSettings": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "autoSyncThreshold": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "fallbackApprovalPhone": { "type": ["string", "null"], "pattern": "^\\+[1-9]\\d{1,14}$" },
+          "whatsappPhoneId": { "type": ["string", "null"] },
+          "rawWhatsAppToken": { "type": "string", "writeOnly": true },
+          "manualMinutesPerUpdate": { "type": "integer", "minimum": 1, "maximum": 120 }
+        }
       }
     }
   },
@@ -691,6 +768,40 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/OnboardingStatus" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/settings": {
+      "get": {
+        "summary": "Retrieve tenant settings (never displays secret tokens)",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TenantSettings" }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Update tenant settings, auto-sync threshold, fallback approval phone, or WhatsApp credentials",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/UpdateTenantSettings" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TenantSettings" }
               }
             }
           }
