@@ -9,6 +9,7 @@
     "db:push": "pnpm --filter @vexel/database db:push",
     "db:migrate": "pnpm --filter @vexel/database db:migrate",
     "db:studio": "pnpm --filter @vexel/database db:studio",
+    "db:seed": "node --experimental-strip-types packages/database/prisma/seed-demo.ts",
     "test": "pnpm --filter @vexel/database exec vitest run --root ../..",
     "test:watch": "pnpm --filter @vexel/database exec vitest --root ../.."
   },

@@ -6,6 +6,7 @@ const rootDir = fileURLToPath(new URL('.', import.meta.url));
 export default {
   resolve: {
     alias: {
+      '@': resolve(rootDir, 'apps/web/src'),
       '@prisma/client': resolve(rootDir, 'packages/database/node_modules/@prisma/client'),
       '@vexel/database': resolve(rootDir, 'packages/database/src/index.ts'),
       '@vexel/anvil-engine': resolve(rootDir, 'packages/anvil-engine/src/runner.ts'),
@@ -16,7 +17,6 @@ export default {
   test: {
     globals: true,
     environment: 'node',
-    include: ['packages/**/*.spec.ts', 'apps/**/*.spec.ts'],
+    include: ['packages/**/*.spec.{ts,tsx}', 'apps/**/*.spec.{ts,tsx}'],
   },
 };
-
